@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 账本本身不进仓库：这是私人数据，不是代码
+*.db
+*.db-wal
+*.db-shm
+data/
+记忆账本.md
+
+# 本地杂项
+.venv/
+venv/
+.env
+*.log
+.DS_Store
+*.bak-*
