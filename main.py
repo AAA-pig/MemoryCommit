@@ -55,6 +55,10 @@ def _is_owner(event) -> bool:
 # 画像块隔多久才注入一次。每轮都念同样的「用户的事」反而吵，默认一小时。
 PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600") or 3600)
 
+# 维护任务（每日导出、工作记忆换班）每 N 轮请求检查一次。
+# 导出本身跨天才真写文件，换班也有冷却，节流省的是每轮那两次空查询。
+MAINTAIN_EVERY = max(1, int(os.environ.get("JJ_MEMORY_MAINTAIN_EVERY", "20") or 20))
+
 
 def _short(text: str, n: int = 40) -> str:
     text = " ".join((text or "").split())
@@ -77,7 +81,7 @@ def _fmt_hit(m: dict, idx: int = 0) -> str:
     return head + tail
 
 
-@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.4.0")
+@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.4.1")
 class MemoryCommitPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -91,6 +95,8 @@ class MemoryCommitPlugin(Star):
         self.INJECT_SLOTS = DEFAULT_INJECT_SLOTS
         # 注入观测账的当前行数（只用来决定要不要轮转，不参与任何行为）
         self._inject_lines = 0
+        # 维护任务节流计数：只有 % MAINTAIN_EVERY == 1 那几轮真去检查
+        self._maintain_tick = 0
         try:
             if INJECT_LOG.exists():
                 with open(INJECT_LOG, encoding="utf-8") as f:
@@ -370,16 +376,20 @@ class MemoryCommitPlugin(Star):
             query = (said or "")[:300]
         else:
             query = raw
-        # 每天第一次请求前顺手刷一次 记忆账本.md，不额外挂定时器
-        try:
-            self.ledger.maybe_export_daily(str(EXPORT_PATH))
-        except Exception as e:
-            logger.warning("[记忆账本] 每日导出失败: %r" % (e,))
-        # 顺手看一眼工作记忆有没有超员：有冷却，没超员就什么都不做
-        try:
-            self.ledger.maybe_rebalance_working_set()
-        except Exception as e:  # 换班失败也不能影响聊天
-            logger.warning("[记忆账本] 工作记忆换班失败: %r" % (e,))
+        # 维护任务不是每轮都必须做：首轮和之后每 MAINTAIN_EVERY 轮各检查一次。
+        # 导出跨天才真写，换班有冷却，节流只是别让请求路径每轮白跑两趟。
+        self._maintain_tick += 1
+        if self._maintain_tick % MAINTAIN_EVERY == 1:
+            # 每天第一次请求前顺手刷一次 记忆账本.md，不额外挂定时器
+            try:
+                self.ledger.maybe_export_daily(str(EXPORT_PATH))
+            except Exception as e:
+                logger.warning("[记忆账本] 每日导出失败: %r" % (e,))
+            # 顺手看一眼工作记忆有没有超员：有冷却，没超员就什么都不做
+            try:
+                self.ledger.maybe_rebalance_working_set()
+            except Exception as e:  # 换班失败也不能影响聊天
+                logger.warning("[记忆账本] 工作记忆换班失败: %r" % (e,))
         try:
             with_profile = (time.time() - self._profile_injected_at) >= PROFILE_REFRESH_SECONDS
             result = self.ledger.activate(query, slots=self.INJECT_SLOTS,

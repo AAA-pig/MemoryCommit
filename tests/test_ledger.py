@@ -582,6 +582,69 @@ class LedgerTest(unittest.TestCase):
         self.assertGreater(got[0]["decay"], 0.0)
         self.assertLessEqual(got[0]["decay"], 1.0)
 
+    def test_recall_reuses_tokens_when_content_unchanged(self):
+        """内容没变就不重复切词：第二轮只剩查询本身要切。"""
+        for i in range(30):
+            self.led.remember("第 %d 条：深夜把歌放得很轻" % i, tags="音乐,深夜")
+        with mock.patch.object(L, "tokenize", wraps=L.tokenize) as m:
+            self.led.recall("深夜的歌", limit=3)
+            first = m.call_count
+        with mock.patch.object(L, "tokenize", wraps=L.tokenize) as m:
+            self.led.recall("深夜的歌", limit=3)
+            second = m.call_count
+        self.assertGreater(first, 30, "第一轮要把每条记忆都切一遍")
+        self.assertLessEqual(second, 3, "第二轮不该再逐条切词，只有查询和少量零碎")
+
+    def test_token_cache_follows_content_change(self):
+        """摘要改过之后必须重新切：缓存靠比对原文失效，不靠谁记得去清。"""
+        r = self.led.remember("用户怕冷，空调别开太低", tags="习惯")
+        row = dict(self.led._query_one("SELECT * FROM memory WHERE id = ?",
+                                       (r["memory_id"],)))
+        first = self.led._doc_tokens(row)
+        self.assertIn("怕冷", first)
+        row["summary"] = "用户怕热，空调开低点"
+        second = self.led._doc_tokens(row)
+        self.assertIn("怕热", second)
+        self.assertNotIn("怕冷", second, "原文变了就不能再吃旧缓存")
+
+    def test_token_cache_does_not_grow_forever(self):
+        """删掉的记忆不该在缓存里越攒越多。"""
+        ids = [self.led.remember("临时条目 %d" % i)["memory_id"] for i in range(600)]
+        self.led.recall("临时条目", limit=3)
+        for mid in ids[:400]:
+            self.led.forget(mid)
+        self.led.recall("临时条目", limit=3)
+        self.assertLess(len(self.led._tok_cache), 600, "缓存要跟着当前记忆收缩")
+
+    def test_concurrent_read_write_no_error(self):
+        """同一条连接读写并发：加了锁就不该出现事务嵌套/连接错误。"""
+        import threading
+        self.led.remember("深夜的歌单", tags="音乐")
+        errs = []
+
+        def reader():
+            try:
+                for _ in range(40):
+                    self.led.recall("深夜", limit=3)
+                    self.led.stats()
+            except Exception as e:
+                errs.append(e)
+
+        def writer():
+            try:
+                for i in range(40):
+                    self.led.remember("并发写入的第 %d 条" % i, tags="并发")
+            except Exception as e:
+                errs.append(e)
+
+        ts = [threading.Thread(target=reader) for _ in range(2)]
+        ts.append(threading.Thread(target=writer))
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        self.assertEqual(errs, [], "并发读写不该报错：%r" % (errs[:3],))
+
 
 class MigrationTest(unittest.TestCase):
     """跨宿主搬库：结构版本要认得出，导出要能原样灌回来。"""
@@ -1354,6 +1417,28 @@ class InjectMemoryTest(unittest.TestCase):
         self.assertTrue(m_act.called)
         self.assertEqual(m_act.call_args[0][0], "今天聊到哪了",
                          "长 prompt 应退回用户原话做词面检索")
+
+    def test_maintain_throttled_after_first(self):
+        """维护任务首轮查一次，之后按 MAINTAIN_EVERY 节流，不是每轮白跑两趟。"""
+        def run_once():
+            with mock.patch.object(self.plugin.ledger, "maybe_export_daily") as m_exp, \
+                 mock.patch.object(self.plugin.ledger, "maybe_rebalance_working_set"), \
+                 mock.patch.object(self.plugin.ledger, "activate",
+                                   return_value={"items": [], "profiles": [],
+                                                 "flashes": [], "route": "activate",
+                                                 "query": ""}), \
+                 mock.patch.object(self.plugin.ledger, "render_brief", return_value=""):
+                asyncio.run(self.plugin.inject_memory(_FakeEvent(), _FakeReq("事很简单")))
+            return m_exp
+
+        m_exp = run_once()
+        self.assertEqual(m_exp.call_count, 1, "首轮要检查一次维护任务")
+        m_exp = run_once()
+        self.assertEqual(m_exp.call_count, 0, "紧接着的一轮不该再查")
+        for _ in range(self.mod.MAINTAIN_EVERY - 2):
+            run_once()
+        m_exp = run_once()
+        self.assertEqual(m_exp.call_count, 1, "到了节流周期要再查一次")
 
     def test_long_prompt_empty_said_stays_empty(self):
         """prompt 超长且 said 也为空：query 才真正置空。"""

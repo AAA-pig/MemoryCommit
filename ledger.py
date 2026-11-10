@@ -33,6 +33,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from functools import lru_cache
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -333,17 +334,28 @@ def now_str() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+@lru_cache(maxsize=8192)
+def _parse_time_cached(text: str) -> float:
+    """时间字符串 → 时间戳。同一个字符串（记忆的 created_at）只解析一次。
+
+    strptime 一次要几十微秒，两千条记忆每轮要解析几千次，光这一项就吃掉近半时间。
+    解析不出来返回 0，让调用方自己决定退回「现在」。
+    """
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(text, fmt))
+        except Exception:
+            continue
+    return 0.0
+
+
 def _parse_time(value: Any) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     if not value:
         return time.time()
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return time.mktime(time.strptime(str(value)[:19], fmt))
-        except Exception:
-            continue
-    return time.time()
+    ts = _parse_time_cached(str(value)[:19])
+    return ts if ts else time.time()
 
 
 # --------------------------------------------------------------------------
@@ -1018,6 +1030,11 @@ class Ledger:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         # 唤起冷却：刚浮现过的记忆，短时间内不再重复浮现
         self._surfaced: Dict[str, float] = {}
+        # 切词缓存：memory_id -> (原文, tokens)。原文变了就不命中，等于自带失效；
+        # 只省切词，不改排序，缓存丢了重算一遍也不影响结果。
+        self._tok_cache: Dict[str, Tuple[str, List[str]]] = {}
+        # 线索切词缓存：线索变动远少于记忆，重复切词纯属浪费
+        self._clue_tok_cache: Dict[str, Tuple[str, set]] = {}
         # 自动压缩阈值（可被外壳/测试覆盖）
         self.auto_compact_after = AUTO_COMPACT_AFTER
         self.auto_compact_keep = AUTO_COMPACT_KEEP
@@ -1097,15 +1114,59 @@ class Ledger:
                    " ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, str(value)))
 
     def _query_one(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-        return self._conn.execute(sql, params).fetchone()
+        # 读也要拿同一把锁：连接是共享的（check_same_thread=False），
+        # 写那边有事务，读这边裸奔就可能读进别人的事务中间态。
+        # RLock 可重入，事务里再调这些查询不会死锁。
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
 
     def _query_all(self, sql: str, params: tuple = ()) -> List[sqlite3.Row]:
-        return self._conn.execute(sql, params).fetchall()
+        with self._lock:
+            return self._conn.execute(sql, params).fetchall()
 
     def _counters(self) -> Dict[str, int]:
-        data = {r["k"]: r["v"] for r in self._conn.execute("SELECT * FROM meta").fetchall()}
+        data = {r["k"]: r["v"] for r in self._query_all("SELECT * FROM meta")}
         return {k: int(data.get(k) or 0) for k in
                 ("commit_no", "memory_no", "clue_no", "profile_no", "created_seq")}
+
+    def _doc_tokens(self, r: Dict[str, Any]) -> List[str]:
+        """一条记忆的切词结果，内容没变就复用。
+
+        key 用 memory_id，但每次都比对原文：摘要或标签改过自然不命中，
+        不需要谁记得来失效——少一个「忘了清缓存」的坑。
+        """
+        text = (r.get("summary") or "") + " " + (r.get("tags") or "")
+        mid = r.get("id") or ""
+        with self._lock:
+            hit = self._tok_cache.get(mid)
+        if hit is not None and hit[0] == text:
+            return hit[1]
+        toks = tokenize(text)
+        if mid:
+            with self._lock:
+                self._tok_cache[mid] = (text, toks)
+        return toks
+
+    def _clue_tokens(self, clue_id: str, content: str) -> set:
+        """线索的切词结果，内容没变就复用。线索表变动远少于记忆表。"""
+        with self._lock:
+            hit = self._clue_tok_cache.get(clue_id or "")
+        if hit is not None and hit[0] == content:
+            return hit[1]
+        toks = set(tokenize(content))
+        if clue_id:
+            with self._lock:
+                self._clue_tok_cache[clue_id] = (content, toks)
+        return toks
+
+    def _trim_tok_cache(self, rows: List[Dict[str, Any]]) -> None:
+        """缓存只留当前这轮还在的记忆，删掉的不占地方。"""
+        if len(self._tok_cache) <= max(512, 2 * len(rows)):
+            return
+        keep = {r.get("id") for r in rows}
+        with self._lock:
+            for k in [k for k in self._tok_cache if k not in keep]:
+                self._tok_cache.pop(k, None)
 
     # -- 读 --
 
@@ -1320,7 +1381,8 @@ class Ledger:
             return []
 
         limit = normalize_limit(limit)
-        docs = [tokenize(r["summary"] + " " + r["tags"]) for r in rows]
+        self._trim_tok_cache(rows)
+        docs = [self._doc_tokens(r) for r in rows]
         q_tokens = tokenize(query) if query else []
         base = _bm25_scores(docs, q_tokens) if q_tokens else [0.0] * len(rows)
         # 写入端只切双字，「辣」这种单字在 BM25 里必然空手，回退成子串命中
@@ -1340,7 +1402,7 @@ class Ledger:
             decay = time_decay(r["created_at"], half_life_days, access)
             score = s * decay if q_tokens else 0.0
             # 无查询时按新鲜度 + 巩固等级排
-            score += time_decay(r["created_at"], half_life_days, access) * 0.05 * (1 + int(r["grade"]))
+            score += decay * 0.05 * (1 + int(r["grade"]))
             score += float(r["importance"]) * 0.02
             r["bm25"] = round(s, 4)
             r["decay"] = round(decay, 4)
@@ -1426,7 +1488,7 @@ class Ledger:
                 "SELECT c.id AS clue_id, c.content AS clue, COUNT(mc.memory_id) AS uses"
                 " FROM clue c LEFT JOIN memory_clue mc ON mc.clue_id = c.id"
                 " GROUP BY c.id"):
-            c_tokens = set(tokenize(row["clue"]))
+            c_tokens = self._clue_tokens(row["clue_id"], row["clue"])
             common = qt & c_tokens
             if not common:
                 continue
@@ -1477,7 +1539,7 @@ class Ledger:
             " GROUP BY c.id")
         scored: List[Tuple[str, float, Any]] = []
         for row in rows:
-            c_tokens = set(tokenize(row["clue"]))
+            c_tokens = self._clue_tokens(row["clue_id"], row["clue"])
             if not c_tokens:
                 continue
             common = q_tokens & c_tokens
