@@ -44,13 +44,43 @@ INJECT_LOG = DATA_DIR / "inject-log.jsonl"
 INJECT_LOG_ROTATE_LINES = 5000
 
 # 哪些会话能用账本。默认不开放，必须显式配置：接第二个平台或者在群里开，
-# 只填环境变量 JJ_MEMORY_OWNERS，不用回来改代码。
+# 填环境变量 JJ_MEMORY_OWNERS 或者 DATA_DIR/owners.json，不用回来改代码。
+OWNERS_FILE = DATA_DIR / "owners.json"
 OWNER_UMOS = frozenset(x.strip() for x in os.environ.get(
     "JJ_MEMORY_OWNERS", "").split(",") if x.strip())
 
+# 环境变量只有进程启动那一刻读得到，改完必须重启；重启还会把启动前刚写进去的
+# 值一并漏掉（2026-11-11 就是这么断链的）。owners.json 按 mtime 每次复核，
+# 改完下一轮就生效，两边取并集。
+_OWNERS_CACHE: dict = {"sig": None, "umos": OWNER_UMOS}
+
+
+def _load_owners() -> frozenset:
+    try:
+        st = OWNERS_FILE.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return OWNER_UMOS
+    if _OWNERS_CACHE["sig"] == sig:
+        return _OWNERS_CACHE["umos"]
+    try:
+        raw = json.loads(OWNERS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("owners.json 读不了，暂时只认环境变量：%s" % e)
+        return OWNER_UMOS
+    if isinstance(raw, dict):
+        raw = raw.get("owners", [])
+    if not isinstance(raw, list):
+        logger.warning("owners.json 期望字符串列表，实际是 %s" % type(raw).__name__)
+        return OWNER_UMOS
+    umos = frozenset(set(OWNER_UMOS) | {
+        x.strip() for x in raw if isinstance(x, str) and x.strip()})
+    _OWNERS_CACHE.update(sig=sig, umos=umos)
+    return umos
+
 
 def _is_owner(event) -> bool:
-    return event.unified_msg_origin in OWNER_UMOS
+    return event.unified_msg_origin in _load_owners()
 
 # 画像块隔多久才注入一次。每轮都念同样的「用户的事」反而吵，默认一小时。
 PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600") or 3600)
@@ -81,7 +111,7 @@ def _fmt_hit(m: dict, idx: int = 0) -> str:
     return head + tail
 
 
-@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.4.1")
+@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.4.2")
 class MemoryCommitPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
