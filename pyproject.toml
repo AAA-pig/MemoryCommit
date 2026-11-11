@@ -14,7 +14,3 @@ dev = [
 
 [tool.uv]
 package = false
-
-[[tool.uv.index]]
-url = "https://pypi.org/simple"
-default = true

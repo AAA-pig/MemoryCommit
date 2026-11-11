@@ -3,10 +3,10 @@ AIGC:
   ContentProducer: '001191110102MAD55U9H0F10002'
   ContentPropagator: '001191110102MAD55U9H0F10002'
   Label: '1'
-  ProduceID: 'c3006695-88c0-4c92-9310-9f58f2ac818c'
-  PropagateID: 'c3006695-88c0-4c92-9310-9f58f2ac818c'
-  ReservedCode1: 'a724c349-1664-4413-b127-205c5f0191d5'
-  ReservedCode2: 'a724c349-1664-4413-b127-205c5f0191d5'
+  ProduceID: '29d49e63-3177-46c8-a5e2-df0787e00293'
+  PropagateID: '29d49e63-3177-46c8-a5e2-df0787e00293'
+  ReservedCode1: '99b38df7-f016-429b-b780-4e4ce9ffc375'
+  ReservedCode2: '99b38df7-f016-429b-b780-4e4ce9ffc375'
 ---
 
 # 记忆账本（astrbot_plugin_memory_commit）
@@ -219,3 +219,5 @@ python -m pytest tests/ -q
 ```
 
 或者直接跑 `python tests/test_ledger.py` 看输出。当前 134 个，不依赖 AstrBot 主体，也不依赖网络。
+
+**关于包索引**：本项目不绑定任何镜像源，仓库配置保持地域中立，uv 默认走官方 PyPI。如果你所在网络访问 pypi.org 较慢，可以自行设置镜像，例如设环境变量 `UV_DEFAULT_INDEX`，或在 uv 命令上加 `--index-url` 参数，把索引指向你选定的镜像（阿里云、清华等均有 PyPI 镜像，可自选）。镜像属于个人网络环境的选择，不写入仓库配置。
