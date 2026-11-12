@@ -26,10 +26,12 @@ from astrbot.api.star import Context, Star, register
 
 try:
     from .ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
-                         Ledger, LedgerError, StaleHeadError, match_denial_keywords)
+                         Ledger, LedgerError, StaleHeadError, match_denial_keywords,
+                         tokenize)
 except ImportError:  # 直接当脚本跑时
     from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
-                        Ledger, LedgerError, StaleHeadError, match_denial_keywords)
+                        Ledger, LedgerError, StaleHeadError, match_denial_keywords,
+                        tokenize)
 
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
 
@@ -90,9 +92,73 @@ def _is_owner(event) -> bool:
 # 画像块隔多久才注入一次。每轮都念同样的「用户的事」反而吵，默认一小时。
 PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600") or 3600)
 
-# 维护任务（每日导出、工作记忆换班）每 N 轮请求检查一次。
-# 导出本身跨天才真写文件，换班也有冷却，节流省的是每轮那两次空查询。
+# 维护任务（每日导出、工作记忆换班、WAL 截断）每 N 轮请求检查一次。
+# 导出本身跨天才真写文件，换班与截断也有冷却，节流省的是每轮那几次空查询。
 MAINTAIN_EVERY = max(1, int(os.environ.get("JJ_MEMORY_MAINTAIN_EVERY", "20") or 20))
+
+# 自动沉淀：每 N 轮（一问一答算一轮）把这几轮的原文按内部规则折成一条 day 记忆。
+# 这是 P0-1 的兜底路径——memory 表原来只靠模型主动调 memory_write，
+# 模型不调就一条不涨（实测停了 4.5 小时）。0 = 关。
+AUTO_SINK_EVERY = max(0, int(os.environ.get("JJ_MEMORY_AUTO_SINK_EVERY", "6") or 0))
+AUTO_SINK_TAG = "自动沉淀"
+
+
+def auto_sink_summary(rows) -> str:
+    """把几轮原文折成一条记忆正文（纯规则，不调模型）。
+
+    只做摘要与关键词，不改写原文、不许当结论引用；原文链一直都在，
+    这条只是「这几轮聊了什么」的索引。
+    """
+    rows = list(rows or [])
+    if not rows:
+        return ""
+    said = " ".join((r.get("content") or "") for r in rows if r.get("role") == "user")
+    if not said:
+        said = " ".join((r.get("content") or "") for r in rows)
+    said = " ".join(said.split())
+    counts = {}
+    for tok in tokenize(said):
+        if len(tok) < 2:
+            continue
+        counts[tok] = counts.get(tok, 0) + 1
+    keywords = []
+    for tok, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        if any(tok in k for k in keywords):
+            continue
+        keywords.append(tok)
+        if len(keywords) >= 5:
+            break
+    head = said if len(said) <= 60 else said[:60] + "…"
+    text = "自动沉淀：最近 %d 条原文（用户 %d 条）。开头是「%s」" % (
+        len(rows), sum(1 for r in rows if r.get("role") == "user"), head)
+    if keywords:
+        text += "；关键词：" + "、".join(keywords)
+    return text[:4000]
+
+
+class FailureCounter:
+    """写路径异常计数（内存即可）。
+
+    以前失败只留一行 warning，重载后什么都不剩；计数能让 /记忆自检 说清
+    「哪条写路径在悄悄失败」。不落盘：重启归零本来就是应该的。
+    """
+
+    def __init__(self):
+        self.counts = {}
+        self.last = {}
+
+    def note(self, kind: str, err: Any) -> int:
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        self.last[kind] = str(err)[:160]
+        return self.counts[kind]
+
+    def total(self) -> int:
+        return sum(self.counts.values())
+
+    def summary(self) -> str:
+        if not self.counts:
+            return "无"
+        return "；".join("%s %d 次" % (k, v) for k, v in sorted(self.counts.items()))
 
 
 def _short(text: str, n: int = 40) -> str:
@@ -170,6 +236,11 @@ class MemoryCommitPlugin(Star):
         # 本轮用户消息在原文链上的序号（v5 增量原文锚）：memory_write 落库时
         # 把新记忆锚回这句原话，后续 trace_to_source 能接回去。
         self._last_user_seq = 0
+        # 写路径异常计数：失败不再只留一行日志
+        self.failures = FailureCounter()
+        # 自动沉淀：距离上一次沉淀又聊了几轮、上次沉到原文链的哪个序号
+        self._turn_since_sink = 0
+        self._last_sink_seq = 0
         try:
             if INJECT_LOG.exists():
                 with open(INJECT_LOG, encoding="utf-8") as f:
@@ -183,6 +254,36 @@ class MemoryCommitPlugin(Star):
     # ------------------------------------------------------------------
     # 工具函数
     # ------------------------------------------------------------------
+
+    def _note_failure(self, kind: str, err: Any) -> None:
+        """记一次写路径异常：计数（给 /记忆自检 看）+ 一行日志（给当场看）。"""
+        n = self.failures.note(kind, err)
+        logger.warning("[记忆账本] %s: %r（累计 %d 次）" % (kind, err, n))
+
+    def _auto_sink(self) -> dict:
+        """不依赖模型自觉的沉淀（P0-1）。
+
+        on_llm_response 每完成一轮就记一次；攒够 AUTO_SINK_EVERY 轮就把这几轮
+        的原文按规则折成一条 level=day 记忆。只新增，不改已有记忆正文，
+        不删原文链。失败不影响回复。
+        """
+        if AUTO_SINK_EVERY <= 0:
+            return {}
+        self._turn_since_sink += 1
+        if self._turn_since_sink < AUTO_SINK_EVERY:
+            return {}
+        rows = self.ledger.recent_messages(limit=AUTO_SINK_EVERY * 2,
+                                           after_seq=self._last_sink_seq)
+        if not rows:
+            return {}
+        summary = auto_sink_summary(rows)
+        if not summary:
+            return {}
+        res = self.ledger.remember(summary, level="day", tags=AUTO_SINK_TAG,
+                                   importance=0.45)
+        self._last_sink_seq = max(int(r["seq"]) for r in rows)
+        self._turn_since_sink = 0
+        return res
 
     def _log_injection(self, outcome: str, query_len: int = 0,
                        stats: dict = None, result: dict = None,
@@ -223,11 +324,11 @@ class MemoryCommitPlugin(Star):
                     # 置 0 会永久少 1，文件要到 5001 行才轮转；重启靠文件行数初始化才自愈。
                     self._inject_lines = 1
                 except Exception as e:
-                    logger.warning("[记忆账本] 注入日志轮转失败: %r" % (e,))
+                    self._note_failure("注入日志轮转失败", e)
             with open(INJECT_LOG, "a", encoding="utf-8") as f:
                 f.write(json.dumps(line, ensure_ascii=False) + "\n")
         except Exception as e:
-            logger.warning("[记忆账本] 注入日志写失败: %r" % (e,))
+            self._note_failure("注入日志写失败", e)
 
     def _status_text(self) -> str:
         st = self.ledger.stats()
@@ -406,6 +507,8 @@ class MemoryCommitPlugin(Star):
             "通过" if chain.get("ok") else "断裂"))
         lines.append("结构版本 v%d · 导出：%s" % (
             st["schema_version"], "可写" if res["export_ok"] else "没写"))
+        lines.append("写路径异常 %d 次：%s" % (self.failures.total(),
+                                            self.failures.summary()))
         if res["problems"]:
             lines.append("")
             lines.extend("- " + p for p in res["problems"])
@@ -439,9 +542,9 @@ class MemoryCommitPlugin(Star):
                     try:
                         self.ledger.queue_denial_suspect(said, keyword=hits[0])
                     except Exception as e:
-                        logger.warning("[记忆账本] 待确认队列写入失败: %r" % (e,))
+                        self._note_failure("待确认队列写入失败", e)
         except Exception as e:
-            logger.warning("[记忆账本] 原文落链失败: %r" % (e,))
+            self._note_failure("原文落链失败", e)
         raw = (getattr(req, "prompt", "") or "").strip()
         # 空提示词就什么都不唤起。
         if not raw:
@@ -467,12 +570,17 @@ class MemoryCommitPlugin(Star):
             try:
                 self.ledger.maybe_export_daily(str(EXPORT_PATH))
             except Exception as e:
-                logger.warning("[记忆账本] 每日导出失败: %r" % (e,))
+                self._note_failure("每日导出失败", e)
             # 顺手看一眼工作记忆有没有超员：有冷却，没超员就什么都不做
             try:
                 self.ledger.maybe_rebalance_working_set()
             except Exception as e:  # 换班失败也不能影响聊天
-                logger.warning("[记忆账本] 工作记忆换班失败: %r" % (e,))
+                self._note_failure("工作记忆换班失败", e)
+            # WAL 只涨不落会让库旁边的 -wal 越堆越大：超阈值就截断一次
+            try:
+                self.ledger.maybe_checkpoint_wal()
+            except Exception as e:  # 截断失败不影响聊天
+                self._note_failure("WAL 截断失败", e)
         try:
             with_profile = (time.time() - self._profile_injected_at) >= PROFILE_REFRESH_SECONDS
             result = self.ledger.activate(query, slots=self.INJECT_SLOTS,
@@ -481,7 +589,7 @@ class MemoryCommitPlugin(Star):
             brief = self.ledger.render_brief(result, max_chars=self.BRIEF_BUDGET,
                                              stats=stats)
         except Exception as e:  # 唤起失败绝不能影响聊天本身
-            logger.warning("[记忆账本] 唤起失败: %r" % (e,))
+            self._note_failure("唤起失败", e)
             return
         self._log_injection("injected" if brief else "no_hit",
                             query_len=len(query), stats=stats, result=result,
@@ -496,7 +604,7 @@ class MemoryCommitPlugin(Star):
 
     @filter.on_llm_response()
     async def record_reply(self, event: AstrMessageEvent, resp) -> None:
-        """把回复的原文接到链尾。失败不影响回复本身。"""
+        """把回复的原文接到链尾，再按轮次攒一次自动沉淀。失败不影响回复本身。"""
         if not _is_owner(event):
             return
         try:
@@ -505,7 +613,13 @@ class MemoryCommitPlugin(Star):
                 self.ledger.append_message(
                     "assistant", text, session_id=(event.unified_msg_origin or ""))
         except Exception as e:
-            logger.warning("[记忆账本] 回复落链失败: %r" % (e,))
+            self._note_failure("回复落链失败", e)
+            return
+        # 沉淀是锦上添花：它炸了只能计数，绝不能连累回复
+        try:
+            self._auto_sink()
+        except Exception as e:
+            self._note_failure("自动沉淀失败", e)
 
     @filter.command("记忆原话")
     async def cmd_raw(self, event: AstrMessageEvent):
@@ -695,5 +809,5 @@ class MemoryCommitPlugin(Star):
         try:
             self.ledger.export_markdown(str(EXPORT_PATH))
         except Exception as e:
-            logger.warning("[记忆账本] 退出导出失败: %r" % (e,))
+            self._note_failure("退出导出失败", e)
         self.ledger.close()
