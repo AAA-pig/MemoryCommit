@@ -35,8 +35,15 @@
 
 ### 测试
 
-- 212 passed + 1 skipped（1.4.2 基线 162 → 212）。新增四个职守测试文件：`test_memory_duty` / `test_dream_duty` / `test_dream_guard` / `test_emotion_reserved`
+- 235 passed + 0 skipped（1.4.2 基线 162 → 1.5.0 首发 212 passed + 1 skipped；解禁 `test_owners` 6 条、新增 `test_tool_args` 13 条到 231，本次再加空检索词 4 条到 235）。新增四个职守测试文件：`test_memory_duty` / `test_dream_duty` / `test_dream_guard` / `test_emotion_reserved`
 - 主库 v4 副本上演练过迁移：539 条一条不少，`message` 链 371 条校验全绿
+
+### 修（推上去之后的补充）
+
+- **owners 名单改了不生效**。`_load_owners` 的缓存签名原来是 `(mtime_ns, size)`：内容等长、mtime 又没跳出同一个时间刻度（NTFS 是 100ns），两次签名一模一样，直接命中旧缓存。`["...:2"]` 改成 `["...:3"]` 长度不变 → 读回来还是旧名单。现在签名存文件全文，坏 JSON / 顶层类型错仍退回环境变量，文件删掉顺手把缓存倒掉
+- **工具参数能把整条回复炸掉**。五个 LLM 工具的参数没做防御：模型传 `None`，`.strip()` 直接 `AttributeError`；传「很高」，`float()` 抛；传「很多」，`int()` 也抛。一条参数脏了，整条回复都没了。现在 `remember(None)` 回「记忆内容不能为空」，`importance` 的 nan 不再被 `min(1.0, nan)` 抬成满分钉死，其余脏值按默认值回落
+- **空检索词会吐一批无关记忆**。`memory_search` 传空串 / 纯空白 / `None` 时原来照样落进 `recall`，按新鲜度排出一批无关条目，看着像找到了，其实什么都没找。现在入口直接拦下，并说明怎么给词
+- 新增 `conftest.py`（最小 astrbot 外壳）：`test_owners.py` 此前因缺 astrbot 被整模块跳过，等于 11-11 那次断链的防线在本地从没真跑过。解禁后 6 条用例当场抓出上面第一个洞，不是补完测试就万事大吉
 
 ### 未做（写清楚，别当成已实现）
 
