@@ -1102,6 +1102,21 @@ def classify_tier(content: Any, memory_type: str = "", tags: Any = None,
 # 提交构造器
 # --------------------------------------------------------------------------
 
+def _clamp_unit(value: Any, default: float = 0.5) -> float:
+    """把 0~1 的强度收进区间：None / nan / inf / 非数字一律回默认值。
+
+    nan 尤其要拦：Python 里 min(1.0, nan) 返回 1.0，于是「没给值」会被
+    悄悄记成满分、钉住不淘汰——方向刚好反了。
+    """
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    if n != n or math.isinf(n):
+        return default
+    return max(0.0, min(1.0, n))
+
+
 class CommitBuilder:
     """变更先攒着，seal 时一次性写进一个事务。"""
 
@@ -1201,7 +1216,7 @@ class CommitBuilder:
         ts = now_str()
         row = {
             "id": mid, "level": level, "grade": grade,
-            "importance": round(max(0.0, min(1.0, float(importance))), 4),
+            "importance": round(_clamp_unit(importance), 4),
             "summary": summary, "tags": ",".join(tag_list),
             "scope_key": (scope_key or "").strip(),
             "start_time": start_time or ts, "end_time": end_time or ts,
@@ -1658,7 +1673,12 @@ class Ledger:
                  importance: float = 0.5, grade: int = 1, scope_key: str = "",
                  start_time: str = "", end_time: str = "",
                  anchor_seq: int = 0) -> Dict[str, Any]:
-        msg = "记下：" + summary.strip()[:24]
+        # summary 可能是 None / 数字：这里是唯一的入库口，先收干净再谈别的，
+        # 否则 .strip() 直接 AttributeError，工具调用整条炸掉。
+        summary = "" if summary is None else str(summary).strip()
+        if not summary:
+            raise LedgerError("记忆内容不能为空")
+        msg = "记下：" + summary[:24]
         builder = self.commit(msg)
         mid = builder.add_memory(summary, level=level, tags=tags, importance=importance,
                                  grade=grade, scope_key=scope_key,
