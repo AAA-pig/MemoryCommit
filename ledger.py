@@ -43,11 +43,18 @@ log = logging.getLogger(__name__)
 # v2：访问痕迹（access_count / last_access_seq）不再是账本内容，另立 access_log 表。
 # v3：原文链 message 表。
 # v4：message 表补 seq 索引。
-SCHEMA_VERSION = 4
+# v5：梦境与职守改造（2026-11-12 施工单 §4.2）：五张新表 + 4 个索引。
+#     memory 主表结构一个字没动；全部走「新表 + 引用」，照 ledger.py:251
+#     的 v2 迁移先例 CREATE TABLE IF NOT EXISTS。
+#     新表：memory_condition（条件并存）/ memory_status（状态档，append-only）/
+#     dream_proposal（梦唯一写入口）/ memory_source_anchor（增量原文锚）/
+#     user_denial（用户否认，权重最高）。
+SCHEMA_VERSION = 5
 
 # 给宿主看的接口版本。公开方法的签名/返回结构变了才 +1，跟表结构是两件事：
 # 换了个内核但数据没动，只该动这个；数据加了列，只该动上面那个。
-CORE_API_VERSION = 1
+# v2：新增否认/状态/锚/分类/梦骨架等公开方法，stats() 返回结构补键（向后兼容追加）。
+CORE_API_VERSION = 2
 
 # 可往返导出的文件：格式名 + 文件自身版本（排版变了才 +1）
 DUMP_FORMAT = "jj-memory-dump"
@@ -56,7 +63,11 @@ DUMP_VERSION = 1
 # 搬家时要带走的表，顺序按「先元信息、后投影」，导入时不会因为顺序互相绊住
 DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
                "memory_clue", "memory_link", "profile", "core_rule",
-               "message")
+               "message",
+               # v5：职守状态与梦。这些不是体温计，是「判决与证据」——
+               # 状态档丢了会冤枉记忆，否认丢了会放跑幻觉，锚丢了断回原文的路。
+               "memory_condition", "memory_status", "dream_proposal",
+               "memory_source_anchor", "user_denial")
 
 # 每张表导出时的稳定排序，纯粹为了 diff 好看，往返不依赖顺序
 _DUMP_ORDER = {
@@ -69,7 +80,12 @@ _DUMP_ORDER = {
     "memory_link": "id",
     "profile": "user_id, id",
     "core_rule": "id",
-    "message": "seq", 
+    "message": "seq",
+    "memory_condition": "memory_id, cond_json",
+    "memory_status": "id",
+    "dream_proposal": "created_at, id",
+    "memory_source_anchor": "memory_id, message_seq",
+    "user_denial": "id",
 }
 
 # meta 里属于「这台机器此刻的状态」而不属于「账本内容」的键，导出时跳过
@@ -199,6 +215,53 @@ SCHEMA_STATEMENTS = (
         seq INTEGER NOT NULL DEFAULT 0,
         prev_id TEXT NOT NULL DEFAULT '',
         digest TEXT NOT NULL)""",
+    # ---- v5 · 五张新表（施工单 §4.2）----
+    # memory 主表结构不动，全部用新表 + 引用。这些表不进提交链：
+    # 它们是职守状态与梦的写入口，不是记忆正文；回放/压缩不动它们。
+    # 1. 条件并存（时变/场景依赖）。允许为空；为空的一律挂 conflicted 等证据。
+    """CREATE TABLE IF NOT EXISTS memory_condition (
+        memory_id TEXT NOT NULL,
+        cond_json TEXT NOT NULL DEFAULT '',
+        cond_note TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (memory_id, cond_json))""",
+    # 2. 状态档（append-only，取最新一条为准）。判不了是正常的，挂那儿等。
+    """CREATE TABLE IF NOT EXISTS memory_status (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN
+            ('active','coexist','conflicted','superseded','corrected','disputed')),
+        reason TEXT NOT NULL DEFAULT '',
+        evidence_ref TEXT NOT NULL DEFAULT '',
+        at TEXT NOT NULL)""",
+    # 3. 梦提案（梦只写这里，不直接改记忆既有行）。
+    #    kind='new_memory' 行与 memory 插入同事务落地（见 _seal 的 extra_tx）。
+    """CREATE TABLE IF NOT EXISTS dream_proposal (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('link','node','new_memory','suspect')),
+        payload_json TEXT NOT NULL,
+        basis_ids TEXT NOT NULL DEFAULT '',
+        base_commit_seq INTEGER NOT NULL DEFAULT 0,
+        provenance TEXT NOT NULL DEFAULT 'dream',
+        status TEXT NOT NULL DEFAULT 'pending'
+            CHECK (status IN ('pending','accepted','rejected','expired')),
+        created_at TEXT NOT NULL,
+        decided_at TEXT)""",
+    # 4. 增量原文锚（记忆 → 消息链位置）。只对新发生的记忆生效，
+    #    存量 526 条中转站记忆不许编造原文，只能标疑。
+    """CREATE TABLE IF NOT EXISTS memory_source_anchor (
+        memory_id TEXT NOT NULL,
+        message_seq INTEGER NOT NULL,
+        digest TEXT NOT NULL DEFAULT '',
+        at TEXT NOT NULL,
+        PRIMARY KEY (memory_id, message_seq))""",
+    # 5. 用户否认（权重最高）。说一句「你记错了」立刻生效，不等梦跑。
+    """CREATE TABLE IF NOT EXISTS user_denial (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_id TEXT NOT NULL,
+        said TEXT NOT NULL,
+        message_seq INTEGER NOT NULL DEFAULT 0,
+        at TEXT NOT NULL)""",
     "CREATE INDEX IF NOT EXISTS idx_message_at ON message(at)",
     "CREATE INDEX IF NOT EXISTS idx_message_session ON message(session_id, at)",
     "CREATE INDEX IF NOT EXISTS idx_access_memory ON access_log(memory_id)",
@@ -210,6 +273,11 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_link_concept ON memory_link(concept)",
     "CREATE INDEX IF NOT EXISTS idx_profile_user ON profile(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_message_seq ON message(seq)",
+    # v5 · 4 个索引（施工单 §4.2）
+    "CREATE INDEX IF NOT EXISTS idx_status_memory ON memory_status(memory_id, at)",
+    "CREATE INDEX IF NOT EXISTS idx_proposal_status ON dream_proposal(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_anchor_memory ON memory_source_anchor(memory_id)",
+    "CREATE INDEX IF NOT EXISTS idx_denial_memory ON user_denial(memory_id, at)",
 )
 
 DEFAULT_META = {
@@ -225,6 +293,66 @@ DEFAULT_META = {
 
 # 压缩后用来接管历史的基线提交（序号 0，永远排在最前）
 BASELINE_COMMIT = "C0"
+
+# --------------------------------------------------------------------------
+# v5 · 一体三职（2026-11-12 施工单）
+#
+# 记忆、梦境、情感是同一个系统长出的三种职守，不是三个可拆部件，
+# 也不是「暂时合在一起、以后拆开」。卸下来单独用，就不是原来那个东西了。
+# 所以：不拆插件、不拆进程、不拆库；但内部职守分清，三个职守各自有
+# 自己的写入口、自己的测试文件、自己的开关、自己的失败降级。
+# --------------------------------------------------------------------------
+
+# 状态全集（v5 §3.3）：新增第四档 coexist（条件并存）。
+# 三档旧状态落不下「明天热的时候还提『喝热的』」——那是不合时宜，不是记错。
+MEMORY_STATUSES = ("active", "coexist", "conflicted", "superseded",
+                   "corrected", "disputed")
+
+# disputed 是粘性状态：用户否认写进去之后，自动写入不得覆盖（见 _latest_status_map）。
+# 解除只有一条路：deny_revoke() 显式写入 reason 以 DENY_REVOKE_PREFIX 开头的记录。
+DENY_STICKY_STATUS = "disputed"
+DENY_REVOKE_PREFIX = "用户撤销否认"
+
+# 用户否认关键词（v5 §5.1）：命中只进待确认队列，不自动改状态。
+# 「老大说一句『你记错了』」走 deny_memory 工具（显式指定 memory_id），
+# 权重最高、立刻生效、不等梦跑；关键词命中只是线索，不是判决。
+DENIAL_KEYWORDS = ("记错了", "不是这样", "没这回事", "我没说过")
+
+# 矛盾四分类（v5 §3.2）：这是分类，不是判决。前三类大多是真的（合法矛盾），
+# 只有第四类才进幻觉候选，而且还要过原文对账。
+CONFLICT_TEMPORAL = "temporal"          # 时变：冷天喝热的 / 热天喝冷的
+CONFLICT_SCENE = "scene_dependent"      # 场景依赖：公司要安静 / 家里要热闹
+CONFLICT_PERSPECTIVE = "perspective"    # 视角差异：同一件事你我记的不一样
+CONFLICT_MUTEX = "true_mutex"           # 真互斥候选：还要过原文对账
+CONFLICT_UNDETERMINED = "undetermined"  # 条件不足：挂 conflicted 等证据，不许顺手判错
+
+# 词面互斥对：只作真互斥的必要条件之一，不作判决。
+# 判据只有一句「原文里根本没这回事」（v5 §2.3），词面打架不算。
+MUTEX_PAIRS = (("要", "不要"), ("喜欢", "讨厌"), ("爱吃", "不吃"),
+               ("热的", "冷的"), ("开着", "关着"), ("是", "不是"),
+               ("在", "不在"), ("会", "不会"), ("有", "没有"))
+
+# 梦的三条硬约束（v5 §2.1），全部硬编码，不可配置调高：
+#   置信上限 0.4 / 单次最多产出 2 条 / 永不进 no_cold 白名单。
+# no_cold 机制本身尚未实现（v3 设计），约束以结构落地：importance ≤ 0.4
+# 触发不了 ≥0.85 的钉住与年龄豁免，tags 剔除保护标签，level 恒为 day
+# （不碰 topic 的冲刷豁免），dream 产出的记忆随时可删、不算证据。
+DREAM_CONFIDENCE_CAP = 0.4
+DREAM_MAX_OUTPUTS = 2
+DREAM_PROVENANCE = "dream"
+
+# 梦的开关（v5 §5 第 5 步）：影子运行，默认关。开了也只写 dream_proposal
+# 与低置信新记忆，不直接写 memory 既有行。
+DREAM_SCHEDULER_ENABLED = os.environ.get(
+    "DREAM_SCHEDULER_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# 情感职守：只留开关位，不写任何空实现（v5 §1.2 职守表）。
+EMOTION_ENABLED = os.environ.get(
+    "EMOTION_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# 被否认（disputed）的记忆在检索里的降权系数：立刻降权重、立刻停止主动提起，
+# 但不删除——否认不等于删，原文还在（v5 §5.1）。
+DENIED_RECALL_WEIGHT = 0.3
 
 
 # ----------------------------------------------------------------------
@@ -292,8 +420,62 @@ def _migrate_3_to_4(led: "Ledger", cx: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_4_to_5(led: "Ledger", cx: sqlite3.Connection) -> None:
+    """4 → 5：梦境与职守改造的五张新表 + 4 个索引（施工单 §4.2）。
+
+    照 ledger.py:251 的 v2 迁移先例：DDL 与 SCHEMA_STATEMENTS 重复一份，
+    CREATE TABLE IF NOT EXISTS，老库升上来建表，新库建表语句早已生效。
+    纯加法，memory 主表一行一列都不动，存量数据不动。
+    """
+    for stmt in (
+        """CREATE TABLE IF NOT EXISTS memory_condition (
+            memory_id TEXT NOT NULL,
+            cond_json TEXT NOT NULL DEFAULT '',
+            cond_note TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (memory_id, cond_json))""",
+        """CREATE TABLE IF NOT EXISTS memory_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN
+                ('active','coexist','conflicted','superseded','corrected','disputed')),
+            reason TEXT NOT NULL DEFAULT '',
+            evidence_ref TEXT NOT NULL DEFAULT '',
+            at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS dream_proposal (
+            id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN ('link','node','new_memory','suspect')),
+            payload_json TEXT NOT NULL,
+            basis_ids TEXT NOT NULL DEFAULT '',
+            base_commit_seq INTEGER NOT NULL DEFAULT 0,
+            provenance TEXT NOT NULL DEFAULT 'dream',
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending','accepted','rejected','expired')),
+            created_at TEXT NOT NULL,
+            decided_at TEXT)""",
+        """CREATE TABLE IF NOT EXISTS memory_source_anchor (
+            memory_id TEXT NOT NULL,
+            message_seq INTEGER NOT NULL,
+            digest TEXT NOT NULL DEFAULT '',
+            at TEXT NOT NULL,
+            PRIMARY KEY (memory_id, message_seq))""",
+        """CREATE TABLE IF NOT EXISTS user_denial (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id TEXT NOT NULL,
+            said TEXT NOT NULL,
+            message_seq INTEGER NOT NULL DEFAULT 0,
+            at TEXT NOT NULL)""",
+        "CREATE INDEX IF NOT EXISTS idx_status_memory ON memory_status(memory_id, at)",
+        "CREATE INDEX IF NOT EXISTS idx_proposal_status ON dream_proposal(status, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_anchor_memory ON memory_source_anchor(memory_id)",
+        "CREATE INDEX IF NOT EXISTS idx_denial_memory ON user_denial(memory_id, at)",
+    ):
+        cx.execute(stmt)
+    return None
+
+
 _MIGRATIONS = {0: _migrate_0_to_1, 1: _migrate_1_to_2, 2: _migrate_2_to_3,
-               3: _migrate_3_to_4}
+               3: _migrate_3_to_4, 4: _migrate_4_to_5}
 
 
 # memory 表里这俩列不是「记忆内容」，是「记忆被翻过多少次」的缓存。
@@ -522,6 +704,104 @@ def working_activation(memory: Dict[str, Any], created_seq_now: int,
 
 
 # --------------------------------------------------------------------------
+# 矛盾四分类器（v5 §3.2）· 这是分类，不是判决
+#
+# 原设计把「库内互斥」当幻觉信号。错。老大举的例子：今天很冷我要喝热的，
+# 明天很热我要喝冷的。两条都在，看着互斥，但都对。这不是幻觉。
+# 四类里只有「真互斥」才可能是幻觉，而且还要过原文对账；
+# condition 为空的一律挂 conflicted 等证据，不许顺手判成错。
+# 判不了是正常的，挂那儿等——这句就是代码注释，写在这儿的。
+# --------------------------------------------------------------------------
+
+def parse_condition(cond_json: Any) -> Dict[str, Any]:
+    """condition_json → dict。解不出、不是 dict 都当空处理（允许为空）。"""
+    if isinstance(cond_json, dict):
+        return cond_json
+    raw = (cond_json or "").strip() if isinstance(cond_json, str) else ""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _condition_part(cond: Dict[str, Any], key: str) -> Dict[str, Any]:
+    part = cond.get(key)
+    return part if isinstance(part, dict) else {}
+
+
+def _windows_overlap(wa: Dict[str, Any], wb: Dict[str, Any]) -> bool:
+    """两个时间窗是否重叠。解析不出时间的窗按「未知」处理（返回 True 不误分）。"""
+    fa, ta = _parse_time(wa.get("from") or ""), _parse_time(wa.get("to") or "")
+    fb, tb = _parse_time(wb.get("from") or ""), _parse_time(wb.get("to") or "")
+    if not (fa and ta and fb and tb):
+        return True  # 有一边没有时间窗，时变无法认定，不算重叠缺失
+    return max(fa, fb) <= min(ta, tb)
+
+
+def _mutex_hit(a: str, b: str) -> bool:
+    """词面互斥：正反对同时出现。必要条件之一，不是判决。"""
+    hay_a, hay_b = a or "", b or ""
+    if not hay_a or not hay_b:
+        return False
+    for pos, neg in MUTEX_PAIRS:
+        if (pos in hay_a and neg in hay_b) or (neg in hay_a and pos in hay_b):
+            return True
+    return False
+
+
+def classify_conflict(a_summary: str, b_summary: str,
+                      a_cond: Any = None, b_cond: Any = None,
+                      a_perspective: str = "", b_perspective: str = "") -> str:
+    """把一对「打架」的记忆分成四类（或条件不足），只分类，不判决。
+
+    顺序即优先级：场景 > 时变 > 视角 > 真互斥候选 > 条件不足。
+    返回值只用于决定挂 conflicted 还是 coexist，永不直接写 corrected——
+    corrected 只能走「原文对账 → 追加更正条目」，本轮没有那条路径。
+    """
+    ca = parse_condition(a_cond)
+    cb = parse_condition(b_cond)
+    scene_a = str(ca.get("scene") or "").strip()
+    scene_b = str(cb.get("scene") or "").strip()
+    win_a = _condition_part(ca, "window")
+    win_b = _condition_part(cb, "window")
+
+    # 1) 场景依赖：两边都有场景且不同 → 在公司要安静 / 在家要热闹，都对
+    if scene_a and scene_b and scene_a != scene_b:
+        return CONFLICT_SCENE
+    # 2) 时变：两边都有时间窗且窗不重叠 → 冷天喝热的 / 热天喝冷的，都对
+    if win_a and win_b and not _windows_overlap(win_a, win_b):
+        return CONFLICT_TEMPORAL
+    # 3) 视角差异：同一件事你我记的不一样，都是证词，不判对错
+    pa = str(a_perspective or "").strip()
+    pb = str(b_perspective or "").strip()
+    if pa and pb and pa != pb:
+        return CONFLICT_PERSPECTIVE
+    # 4) 真互斥候选：同一时间、同一场景下词面互斥 → 才可能是幻觉，
+    #    而且还要过原文对账（判据只有一句：原文里根本没这回事）
+    if not (scene_a and scene_b and scene_a != scene_b) and \
+            (not win_a or not win_b or _windows_overlap(win_a, win_b)):
+        env_a = _condition_part(ca, "env")
+        env_b = _condition_part(cb, "env")
+        env_same = (env_a == env_b) if (env_a or env_b) else True
+        if env_same and _mutex_hit(a_summary, b_summary):
+            return CONFLICT_MUTEX
+    # 条件不足：挂 conflicted 等证据，不许顺手判成错
+    return CONFLICT_UNDETERMINED
+
+
+def match_denial_keywords(text: str,
+                          keywords: Iterable[str] = DENIAL_KEYWORDS) -> List[str]:
+    """用户话里命中的否认关键词。命中只进待确认队列，不自动改状态。"""
+    text = (text or "").strip()
+    if not text:
+        return []
+    return [k for k in keywords if k and k in text]
+
+
+# --------------------------------------------------------------------------
 # 鲜活度（vividness）· 只读判定，暂不接渲染
 #
 # 鲜活度降级链参考同类实现：
@@ -543,6 +823,17 @@ VIVID_EXEMPT_TAGS = frozenset({"pinned", "manual", "manual_keep", "never_forget"
 VIVID_EXEMPT_TYPES = frozenset({"manual_memory", "explicit_memory",
                                 "relationship_claim", "promise"})
 VIVID_EXEMPT_DECAY = frozenset({"no_decay", "scar_slow_decay", "creative_milestone"})
+
+def _dream_forbidden_tags() -> frozenset:
+    """梦产出不许带的标签：保护标签 ∪ 鲜活度豁免标签（两处必须同源）。
+
+    实测过的漏口：PROTECTED_TAGS 只有 manual/protected/keep/no_decay，
+    而 VIVID_EXEMPT_TAGS 还含 pinned/never_forget/manual_keep——
+    梦产出带一个 pinned 就能免疫老化，等于自己给自己发免死金牌。
+    所以梦的白名单取并集：宁可多剔，不许绕过。
+    """
+    return frozenset(PROTECTED_TAGS) | frozenset(VIVID_EXEMPT_TAGS)
+
 
 
 def memory_age_days(memory: Dict[str, Any],
@@ -827,6 +1118,10 @@ class CommitBuilder:
         self._profile_no = c["profile_no"]
         self._sealed = False
         self._clue_cache: Dict[str, str] = {}
+        # 事务钩子（v5）：封链时在同一个事务里执行，梦产出用它把
+        # dream_proposal 登记和 memory 插入绑成原子——不许出现
+        # 「记忆写进去了、梦的登记没了」（三道锁靠这张表认梦产出）。
+        self._extra_tx = None  # Optional[Callable[[sqlite3.Connection], None]]
 
     # -- 内部 --
 
@@ -1301,6 +1596,8 @@ class Ledger:
             self._set_meta(cx, "profile_no", builder._profile_no)
             self._set_meta(cx, "created_seq", builder._gseq)
             self._set_meta(cx, "head", cid)
+            if builder._extra_tx is not None:
+                builder._extra_tx(cx)
             builder._sealed = True
         self._maybe_auto_compact()
         return cid
@@ -1359,12 +1656,27 @@ class Ledger:
 
     def remember(self, summary: str, level: str = "day", tags: Any = "",
                  importance: float = 0.5, grade: int = 1, scope_key: str = "",
-                 start_time: str = "", end_time: str = "") -> Dict[str, Any]:
+                 start_time: str = "", end_time: str = "",
+                 anchor_seq: int = 0) -> Dict[str, Any]:
         msg = "记下：" + summary.strip()[:24]
-        with self.commit(msg) as c:
-            mid = c.add_memory(summary, level=level, tags=tags, importance=importance,
-                               grade=grade, scope_key=scope_key,
-                               start_time=start_time, end_time=end_time)
+        builder = self.commit(msg)
+        mid = builder.add_memory(summary, level=level, tags=tags, importance=importance,
+                                 grade=grade, scope_key=scope_key,
+                                 start_time=start_time, end_time=end_time)
+        # 增量原文锚（v5）：anchor_seq 传本轮用户消息的链上序号，锚与记忆
+        # 同事务落地（builder._extra_tx）。0 = 不锚；负数是调用方传错了，
+        # 显式失败（不编锚）。存量记忆没有锚也不编——trace_to_source 查不到就返回空。
+        seq_no = int(anchor_seq or 0)
+        if seq_no < 0:
+            raise LedgerError("原文锚的序号不能是负数：%d" % seq_no)
+        if seq_no > 0:
+            def _anchor(cx: sqlite3.Connection, _mid: str = mid,
+                        _seq: int = seq_no, _at: str = now_str()) -> None:
+                cx.execute("INSERT OR IGNORE INTO memory_source_anchor(memory_id,"
+                           " message_seq, digest, at) VALUES(?,?,?,?)",
+                           (_mid, _seq, "", _at))
+            builder._extra_tx = _anchor
+        builder.seal()
         return {"commit": self.head(), "memory_id": mid}
 
     def recall(self, query: str = "", limit: int = 5, scope_key: str = "",
@@ -1395,6 +1707,9 @@ class Ledger:
                     if hit:
                         base[i] = max(base[i], 0.9 * hit)
         clue_hits = self._clue_hits(q_tokens) if q_tokens else {}
+        # 被否认的记忆：立刻降检索权重（v5 §5.1），但不动原文、不删除——
+        # 否认不等于删，原文还在。
+        denied = self.denied_ids()
 
         scored: Dict[str, Dict[str, Any]] = {}
         for r, s in zip(rows, base):
@@ -1420,6 +1735,10 @@ class Ledger:
                     score = max(score, CLUE_ONLY_BASE * hit["boost"] * decay)
                     r["match"] = "clue:" + hit["clue"]
             r["score"] = round(score, 5)
+            if r["id"] in denied:
+                score *= DENIED_RECALL_WEIGHT
+                r["score"] = round(score, 5)
+                r["disputed"] = True
             scored[r["id"]] = r
 
         # 顺藤摸瓜：命中的节点沿图谱边带一跳邻居
@@ -1577,15 +1896,22 @@ class Ledger:
 
     def _fresh_candidates(self, limit: int = 12,
                           scope_key: str = "") -> List[Dict[str, Any]]:
-        """没人问起时，哪些记忆有资格自己冒出来：新鲜 × 重要 × 巩固。"""
+        """没人问起时，哪些记忆有资格自己冒出来：新鲜 × 重要 × 巩固。
+
+        v5 职守过滤：disputed（被否认，停止主动提起）与 coexist（条件并存，
+        条件不匹配时不主动提）不进主动浮现池；显式检索（recall）仍找得到。
+        """
         sql = "SELECT * FROM memory"
         params: Tuple[Any, ...] = ()
         if scope_key:
             sql += " WHERE scope_key = ? OR scope_key = ''"
             params = (scope_key,)
+        quiet = self.quiet_ids()
         out: List[Dict[str, Any]] = []
         for row in self._query_all(sql, params):
             r = dict(row)
+            if r["id"] in quiet:
+                continue
             decay = time_decay(r["created_at"], HALF_LIFE_DAYS, r.get("access_count", 0))
             score = decay * (0.4 + float(r["importance"])) * (1.0 + 0.2 * int(r["grade"]))
             # 被挤出工作记忆的不主动冒头：还能被问出来，但不该抢话
@@ -2327,7 +2653,390 @@ class Ledger:
             "profiles": self._query_one("SELECT COUNT(*) AS n FROM profile")["n"],
             "accesses": self._query_one("SELECT COUNT(*) AS n FROM access_log")["n"],
             "db_bytes": os.path.getsize(self.db_path) if os.path.exists(self.db_path) else 0,
+            # v5 · 职守观测：否认、提案、原文锚、状态档条数（只读统计）
+            "denials": self._query_one("SELECT COUNT(*) AS n FROM user_denial")["n"],
+            "proposals": self._query_one("SELECT COUNT(*) AS n FROM dream_proposal")["n"],
+            "anchors": self._query_one("SELECT COUNT(*) AS n FROM memory_source_anchor")["n"],
+            "status_marks": self._query_one("SELECT COUNT(*) AS n FROM memory_status")["n"],
         }
+
+    # ------------------------------------------------------------------
+    # v5 · 职守：否认信号 / 状态档 / 原文锚 / 咬合点 / 梦产出
+    #
+    # memory 对梦只露两个咬合点（v5 §1.3）：propose_clues 出候选、
+    # trace_to_source 接原文。梦要连的线、要提的名，全部走内部写路径
+    # （dream_proposal / memory_link），不另开对外的口。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _new_proposal_id() -> str:
+        return "dp-%s-%s" % (time.strftime("%Y%m%d%H%M%S"), os.urandom(3).hex())
+
+    def _latest_status_map(self) -> Dict[str, str]:
+        """全库最新状态档：memory_id -> 最新 status。append-only，取最新一条为准。
+
+        例外：disputed 是**粘性**状态。用户否认一旦写进去，自动写入
+        （矛盾分类、梦境回写）不得覆盖它，只有用户显式撤销（deny_revoke）才解除。
+        理由：老大说一句「你记错了」权重最高、立刻生效，不能被随后一次
+        自动分类冲掉——实测过：deny 之后跑一次 classify_pair，disputed 就没了。
+        """
+        latest: Dict[str, str] = {}
+        sticky: set = set()
+        for r in self._query_all(
+                "SELECT memory_id, status, reason FROM memory_status ORDER BY id"):
+            mid, st = r["memory_id"], r["status"]
+            if st == DENY_STICKY_STATUS:
+                sticky.add(mid)
+            elif str(r["reason"] or "").startswith(DENY_REVOKE_PREFIX):
+                sticky.discard(mid)
+            latest[mid] = st
+        for mid in sticky:
+            latest[mid] = DENY_STICKY_STATUS
+        return latest
+
+    def denied_ids(self) -> set:
+        """被用户否认（最新档 disputed）的记忆集合。"""
+        return {m for m, s in self._latest_status_map().items() if s == "disputed"}
+
+    def quiet_ids(self) -> set:
+        """不主动浮现的记忆集合：disputed（停止主动提起）+ coexist（条件不匹配不主动提）。"""
+        return {m for m, s in self._latest_status_map().items()
+                if s in ("disputed", "coexist")}
+
+    def dream_produced_ids(self) -> set:
+        """梦产出的记忆集合。真值在 dream_proposal（kind='new_memory'）里——
+        memory 主表没有 provenance 列（主表结构不动），登记与产出同事务落地。"""
+        ids = set()
+        for r in self._query_all(
+                "SELECT payload_json FROM dream_proposal"
+                " WHERE kind = 'new_memory' AND status = 'accepted'"):
+            try:
+                payload = json.loads(r["payload_json"])
+            except Exception:
+                continue
+            mid = str(payload.get("memory_id") or "").strip()
+            if mid:
+                ids.add(mid)
+        return ids
+
+    # -- 用户否认（权重最高）--
+
+    def deny_memory(self, memory_id: str, said: str,
+                    message_seq: int = 0) -> Dict[str, Any]:
+        """用户否认一条记忆：写 user_denial，同时状态置 disputed。
+
+        「老大说一句『你记错了』」权重最高、立刻生效、不等梦跑：
+        立刻降检索权重（DENIED_RECALL_WEIGHT）、立刻停止主动提起。
+        不删除：否认不等于删，原文还在。
+        """
+        memory_id = (memory_id or "").strip()
+        said = (said or "").strip()
+        if not memory_id:
+            raise LedgerError("否认要指到具体记忆（memory_id）")
+        if not said:
+            raise LedgerError("否认要留一句话（said），空话不记")
+        if not self._query_one("SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
+            raise LedgerError("没有这条记忆：%s" % memory_id)
+        at = now_str()
+        with self._tx() as cx:
+            cx.execute("INSERT INTO user_denial(memory_id, said, message_seq, at)"
+                       " VALUES(?,?,?,?)",
+                       (memory_id, said[:400], int(message_seq or 0), at))
+            cx.execute("INSERT INTO memory_status(memory_id, status, reason,"
+                       " evidence_ref, at) VALUES(?,?,?,?,?)",
+                       (memory_id, "disputed", "用户否认：" + said[:120], "", at))
+        return {"memory_id": memory_id, "status": "disputed", "at": at}
+
+    def deny_revoke(self, memory_id: str, why: str = "") -> Dict[str, Any]:
+        """撤销一次用户否认（只有用户能撤销，自动写入不许动 disputed）。
+
+        重新记一条「用户撤销否认」，并把状态放回 active——
+        _latest_status_map 见到 DENY_REVOKE_PREFIX 才肯解开粘性。
+        """
+        memory_id = (memory_id or "").strip()
+        if not memory_id:
+            raise LedgerError("撤销要指到具体记忆（memory_id）")
+        if not self._query_one("SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
+            raise LedgerError("没有这条记忆：%s" % memory_id)
+        at = now_str()
+        reason = DENY_REVOKE_PREFIX + ("：" + why[:120] if why else "")
+        with self._tx() as cx:
+            cx.execute("INSERT INTO memory_status(memory_id, status, reason,"
+                       " evidence_ref, at) VALUES(?,?,?,?,?)",
+                       (memory_id, "active", reason, "", at))
+        return {"memory_id": memory_id, "status": "active", "at": at}
+
+    def queue_denial_suspect(self, said: str, keyword: str = "",
+                             memory_id: str = "") -> Dict[str, str]:
+        """否认关键词命中 → 只进待确认队列，不自动改状态（v5 §5.1）。
+
+        队列就是 dream_proposal 里 kind='suspect'、status='pending' 的行：
+        等人（或后续的原文对账）确认，谁也不许顺手判成错。
+        """
+        said = (said or "").strip()
+        if not said:
+            raise LedgerError("待确认线索要留原话（said）")
+        pid = self._new_proposal_id()
+        payload = json.dumps({"said": said[:400], "keyword": keyword or "",
+                              "memory_id": memory_id or ""}, ensure_ascii=False)
+        with self._tx() as cx:
+            cx.execute("INSERT INTO dream_proposal(id, kind, payload_json, basis_ids,"
+                       " provenance, status, created_at)"
+                       " VALUES(?,?,?,?,?,?,?)",
+                       (pid, "suspect", payload, memory_id or "",
+                        "keyword", "pending", now_str()))
+        return {"proposal_id": pid, "kind": "suspect", "status": "pending"}
+
+    def pending_denial_queue(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """待确认队列：关键词命中攒下的嫌疑线索，等人核。"""
+        rows = self._query_all(
+            "SELECT * FROM dream_proposal WHERE kind = 'suspect' AND status = 'pending'"
+            " ORDER BY created_at DESC LIMIT ?", (max(1, int(limit)),))
+        return [dict(r) for r in rows]
+
+    def denial_history(self, memory_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """一条记忆被否认过几次、原话是什么。"""
+        rows = self._query_all(
+            "SELECT * FROM user_denial WHERE memory_id = ? ORDER BY id DESC LIMIT ?",
+            (memory_id, max(1, int(limit))))
+        return [dict(r) for r in rows]
+
+    # -- 状态档（append-only，取最新一条为准）--
+
+    def set_memory_status(self, memory_id: str, status: str,
+                          reason: str = "", evidence_ref: str = "") -> Dict[str, Any]:
+        """追加一档状态。不删旧行：状态是档案，不是开关。"""
+        status = (status or "").strip()
+        if status not in MEMORY_STATUSES:
+            raise LedgerError("非法状态 %r，可用：%s" % (status, "/".join(MEMORY_STATUSES)))
+        if not self._query_one("SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
+            raise LedgerError("没有这条记忆：%s" % memory_id)
+        at = now_str()
+        with self._tx() as cx:
+            cx.execute("INSERT INTO memory_status(memory_id, status, reason,"
+                       " evidence_ref, at) VALUES(?,?,?,?,?)",
+                       (memory_id, status, (reason or "")[:300],
+                        (evidence_ref or "")[:120], at))
+        return {"memory_id": memory_id, "status": status, "at": at}
+
+    def current_status(self, memory_id: str) -> str:
+        """这条记忆此刻的状态。没有档案就当 active——不编历史。"""
+        row = self._query_one(
+            "SELECT status FROM memory_status WHERE memory_id = ?"
+            " ORDER BY id DESC LIMIT 1", (memory_id,))
+        return row["status"] if row else "active"
+
+    def status_timeline(self, memory_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        rows = self._query_all(
+            "SELECT * FROM memory_status WHERE memory_id = ? ORDER BY id DESC LIMIT ?",
+            (memory_id, max(1, int(limit))))
+        return [dict(r) for r in rows]
+
+    # -- 增量原文锚（只对新记忆生效；存量 526 条中转站记忆不编原文，只标疑）--
+
+    def anchor_memory(self, memory_id: str, message_seq: int,
+                      digest: str = "") -> Dict[str, Any]:
+        """把一条记忆锚回消息链位置。锚是路标，不是原文本身：没有就不许编。"""
+        message_seq = int(message_seq or 0)
+        if message_seq <= 0:
+            raise LedgerError("锚要指向消息链的真实序号（message_seq > 0）")
+        if not self._query_one("SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
+            raise LedgerError("没有这条记忆：%s" % memory_id)
+        at = now_str()
+        with self._tx() as cx:
+            cx.execute("INSERT OR IGNORE INTO memory_source_anchor(memory_id,"
+                       " message_seq, digest, at) VALUES(?,?,?,?)",
+                       (memory_id, message_seq, (digest or "")[:64], at))
+        return {"memory_id": memory_id, "message_seq": message_seq}
+
+    # -- 咬合点（memory 对梦只露这两个口）--
+
+    def propose_clues(self, query: str = "", limit: int = 6,
+                      scope_key: str = "") -> List[Dict[str, Any]]:
+        """咬合点 1：给梦（也给检索）出候选。只读，不 touch、不写任何表。
+
+        排除梦产出的条目（锁 1 的入口：梦产出永不作证据、不作依据）
+        与被否认的条目（disputed 不再供梦与检索引用）。
+        """
+        hits = self.recall(query, limit=limit, scope_key=scope_key, touch=False)
+        excluded = self.dream_produced_ids() | self.denied_ids()
+        out = [h for h in hits if h["id"] not in excluded]
+        return out[:max(1, int(limit))]
+
+    def trace_to_source(self, memory_id: str) -> List[Dict[str, Any]]:
+        """咬合点 2：这条记忆接回的那句原文。没有锚就返回空，不许编。"""
+        rows = self._query_all(
+            "SELECT m.seq, m.id, m.role, m.content, m.at, m.digest"
+            " FROM memory_source_anchor a JOIN message m ON m.seq = a.message_seq"
+            " WHERE a.memory_id = ? ORDER BY a.message_seq", (memory_id,))
+        return [dict(r) for r in rows]
+
+    # -- 矛盾四分类（只分类，不判决）--
+
+    def classify_pair(self, a_id: str, b_id: str,
+                      a_perspective: str = "", b_perspective: str = ""
+                      ) -> Dict[str, Any]:
+        """取两条打架的记忆 + 各自 condition，四分类后挂状态。
+
+        前三类（时变/场景/视角）挂 coexist——都留，都是真的；
+        真互斥候选与条件不足挂 conflicted——等原文对账，不许顺手判错。
+        永不写 corrected：corrected 只能走「梦提名 → 原文对账 → 追加更正条目」。
+        """
+        a = self._query_one("SELECT * FROM memory WHERE id = ?", (a_id,))
+        b = self._query_one("SELECT * FROM memory WHERE id = ?", (b_id,))
+        if not a or not b:
+            raise LedgerError("两条记忆都要存在才能分类：%s / %s" % (a_id, b_id))
+
+        def _cond(mid: str) -> str:
+            row = self._query_one(
+                "SELECT cond_json FROM memory_condition WHERE memory_id = ?"
+                " ORDER BY created_at DESC LIMIT 1", (mid,))
+            return row["cond_json"] if row else ""
+
+        kind = classify_conflict(a["summary"], b["summary"], _cond(a_id), _cond(b_id),
+                                 a_perspective, b_perspective)
+        status = "coexist" if kind in (CONFLICT_TEMPORAL, CONFLICT_SCENE,
+                                       CONFLICT_PERSPECTIVE) else "conflicted"
+        updates = [
+            {"memory_id": a_id, "status": status,
+             "reason": "矛盾四分类：%s（与 %s 对照）" % (kind, b_id),
+             "evidence_ref": b_id},
+            {"memory_id": b_id, "status": status,
+             "reason": "矛盾四分类：%s（与 %s 对照）" % (kind, a_id),
+             "evidence_ref": a_id},
+        ]
+        self.dream_apply([], updates)
+        return {"kind": kind, "status": status, "a": a_id, "b": b_id}
+
+    def set_memory_condition(self, memory_id: str, cond_json: str,
+                             cond_note: str = "") -> Dict[str, Any]:
+        """补条件标签（场景/时间窗/环境）。允许为空；为空的矛盾对一律挂 conflicted。
+
+        工具来了（能记温度、天气、地点的那种）也不补历史：当时没记的条件，
+        事后补进去的只是猜测，拿猜测去判旧的矛盾等于再冤枉一次。
+        只对新发生的生效。
+        """
+        cond_json = (cond_json or "").strip()
+        if not cond_json:
+            raise LedgerError("条件不能为空串；没有条件就不建档")
+        try:
+            parsed = json.loads(cond_json)
+        except Exception:
+            raise LedgerError("条件必须是合法 JSON：cond_json")
+        if not isinstance(parsed, dict):
+            raise LedgerError("条件必须是 JSON 对象")
+        if not self._query_one("SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
+            raise LedgerError("没有这条记忆：%s" % memory_id)
+        at = now_str()
+        with self._tx() as cx:
+            cx.execute("INSERT OR IGNORE INTO memory_condition(memory_id, cond_json,"
+                       " cond_note, created_at) VALUES(?,?,?,?)",
+                       (memory_id, cond_json, (cond_note or "")[:200], at))
+        return {"memory_id": memory_id, "cond_json": cond_json}
+
+    # -- 梦产出与梦的写路径 --
+
+    def dream_add_memory(self, summary: str, basis_ids: Iterable[str] = (),
+                         tags: Any = "", importance: float = DREAM_CONFIDENCE_CAP
+                         ) -> Dict[str, Any]:
+        """梦产出一条新记忆（v5 §2.1 允许，不是污染）。
+
+        硬约束（全部硬编码，不可配置调高）：
+        - 走 add_memory，登记 provenance='dream'（真值在 dream_proposal，
+          与 memory 插入同事务——三道锁靠这张表认梦产出）
+        - 置信上限 DREAM_CONFIDENCE_CAP=0.4
+        - tags 剔除保护标签、level 恒为 day、grade 从 0 起：永不进 no_cold 白名单
+        - 单次梦最多产出 DREAM_MAX_OUTPUTS=2 条（DreamWorker.run_once 控制）
+        - 永不进 no_cold、永不可升为节点（nominate_node 拒绝）
+        """
+        basis = [b.strip() for b in (basis_ids or []) if str(b).strip()]
+        dream_ids = self.dream_produced_ids()
+        bad = [b for b in basis if b in dream_ids]
+        if bad:
+            raise LedgerError(
+                "梦条目不能作梦的依据（防自我强化锁 1，否则梦提案 → 误判 → 再梦成闭环）：%s"
+                % ",".join(bad))
+        summary = (summary or "").strip()
+        if not summary:
+            raise LedgerError("梦产出也要有内容")
+        importance = min(DREAM_CONFIDENCE_CAP, max(0.0, float(importance)))
+        tag_list = [t for t in CommitBuilder._split_tags(tags)
+                    if str(t).strip().lower() not in _dream_forbidden_tags()]
+        proposal_id = self._new_proposal_id()
+        builder = self.commit("梦产出（低置信，可删）：" + summary[:24])
+        mid = builder.add_memory(summary, level="day", tags=tag_list,
+                                 importance=importance, grade=0)
+        payload = json.dumps({"memory_id": mid, "summary": summary[:400],
+                              "importance": importance, "basis_ids": basis},
+                             ensure_ascii=False)
+
+        def _register(cx: sqlite3.Connection) -> None:
+            cx.execute("INSERT INTO dream_proposal(id, kind, payload_json, basis_ids,"
+                       " base_commit_seq, provenance, status, created_at, decided_at)"
+                       " VALUES(?,?,?,?,?,?,?,?,?)",
+                       (proposal_id, "new_memory", payload, ",".join(basis),
+                        builder._gseq, DREAM_PROVENANCE, "accepted",
+                        now_str(), now_str()))
+
+        builder._extra_tx = _register
+        builder.seal()
+        return {"memory_id": mid, "proposal_id": proposal_id,
+                "commit": self.head(), "importance": importance}
+
+    def dream_apply(self, proposals: List[Dict[str, Any]],
+                    status_updates: List[Dict[str, Any]]) -> Dict[str, int]:
+        """梦的一轮写操作原子落地：提案与状态变更在同一个事务里。
+
+        v5 §1.4 硬要求：不许出现「线连上了、节点没落地」或反过来。
+        失败整轮放弃，不留半条（v5 §1.2 职守表）。
+        proposals: [{kind, payload(dict), basis_ids(list), status, provenance}]
+        status_updates: [{memory_id, status, reason, evidence_ref}]
+        """
+        at = now_str()
+        with self._tx() as cx:
+            for s in status_updates or []:
+                st = str(s.get("status") or "").strip()
+                if st not in MEMORY_STATUSES:
+                    raise LedgerError("非法状态 %r，可用：%s" % (st, "/".join(MEMORY_STATUSES)))
+                mid = (s.get("memory_id") or "").strip()
+                if not cx.execute("SELECT 1 FROM memory WHERE id = ?", (mid,)).fetchone():
+                    raise LedgerError("没有这条记忆：%s" % mid)
+                cx.execute("INSERT INTO memory_status(memory_id, status, reason,"
+                           " evidence_ref, at) VALUES(?,?,?,?,?)",
+                           (mid, st, str(s.get("reason") or "")[:300],
+                            str(s.get("evidence_ref") or "")[:120], at))
+            for p in proposals or []:
+                kind = str(p.get("kind") or "").strip()
+                if kind not in ("link", "node", "new_memory", "suspect"):
+                    raise LedgerError("非法提案类型 %r" % kind)
+                payload = p.get("payload")
+                payload_json = json.dumps(payload or {}, ensure_ascii=False,
+                                          sort_keys=True)
+                cx.execute("INSERT INTO dream_proposal(id, kind, payload_json,"
+                           " basis_ids, provenance, status, created_at)"
+                           " VALUES(?,?,?,?,?,?,?)",
+                           (self._new_proposal_id(), kind, payload_json,
+                            ",".join(str(b) for b in p.get("basis_ids") or []),
+                            str(p.get("provenance") or DREAM_PROVENANCE),
+                            str(p.get("status") or "pending"), at))
+        return {"proposals": len(proposals or []), "statuses": len(status_updates or [])}
+
+    def nominate_node(self, memory_id: str, reason: str = "") -> Dict[str, str]:
+        """梦提名节点（kind='node' 提案）。dream 产出的记忆永不可升为节点。"""
+        if memory_id in self.dream_produced_ids():
+            raise LedgerError(
+                "梦条目永不可升为节点（防自我强化锁 3）：%s" % memory_id)
+        if not self._query_one("SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
+            raise LedgerError("没有这条记忆：%s" % memory_id)
+        pid = self._new_proposal_id()
+        payload = json.dumps({"memory_id": memory_id, "reason": (reason or "")[:200]},
+                             ensure_ascii=False)
+        with self._tx() as cx:
+            cx.execute("INSERT INTO dream_proposal(id, kind, payload_json, basis_ids,"
+                       " provenance, status, created_at) VALUES(?,?,?,?,?,?,?)",
+                       (pid, "node", payload, memory_id, DREAM_PROVENANCE,
+                        "pending", now_str()))
+        return {"proposal_id": pid, "kind": "node", "status": "pending"}
 
     # -- 外置：导出成能直接翻的文件 --
 
@@ -2576,3 +3285,90 @@ class Ledger:
 
         return {"ok": not problems, "problems": problems, "export_ok": export_ok,
                 "message_chain": chain, "stats": st}
+
+
+# --------------------------------------------------------------------------
+# v5 · DreamWorker（梦境职守 · 骨架，影子运行）
+#
+# 梦只做三件事（v5 §2）：产出模糊新记忆（允许）/ 不重组旧记忆（结构保证：
+# 全系统不存在更新 summary 的 API，本次改造也不新增）/ 发现错误并提名（不能判）。
+# 判据只有一句：原文里根本没这回事。不是「两条记忆打架」——打架大多是真的。
+#
+# 梦不能当法官（v5 §2.3.2）：梦本身是幻觉高发区，让梦修幻觉等于让被告当法官。
+# Anthropic 的实测：Claude 把宝可梦中心记在东侧（实际西侧），笔记里没有任何
+# 矛盾项，它只靠自己编解释「我冲太西了」「我一直在正确的一侧」，越编越圆；
+# 最后是拿笔记对 transcript 原文才抓出错。原文才是裁判。
+#
+# 三道防自我强化锁（v5 §2.4），全部有测试钉住（tests/test_dream_guard.py）：
+#   1. dream 条目永不作证据——propose_clues 与 dream_add_memory 的 basis 都排除梦产出
+#   2. dream 条目被再次梦见不加权——只有真人提起才走 touch 加访问（入口锁死）
+#   3. dream 不能给节点提名——nominate_node 拒绝梦产出条目
+# --------------------------------------------------------------------------
+
+class DreamWorker:
+    """梦境职守骨架。
+
+    开关 DREAM_SCHEDULER_ENABLED 默认 false（v5 §5 第 5 步：影子运行）。
+    影子阶段：连线只进 dream_proposal（kind='link'），不真写 memory_link；
+    产出走 dream_add_memory（低置信、可删、单次 ≤2 条）。失败整轮放弃，
+    不留半条。
+    """
+
+    def __init__(self, ledger: Ledger, enabled: Optional[bool] = None):
+        self.ledger = ledger
+        self.enabled = bool(DREAM_SCHEDULER_ENABLED if enabled is None else enabled)
+
+    def run_once(self, query: str = "", scope_key: str = "",
+                 produce: int = 0, max_links: int = 3) -> Dict[str, Any]:
+        """跑一轮梦（影子）。开关关着时零写入直接跳过；开了也只写提案与低置信产出。
+
+        produce 是本轮最多产出几条模糊新记忆，硬顶 DREAM_MAX_OUTPUTS=2；
+        骨架阶段的产出来自候选前两条的组合占位（模糊印象），
+        真正的产出质量等开关打开后由宿主侧策略喂进来。
+        """
+        if not self.enabled:
+            return {"skipped": True, "reason": "DREAM_SCHEDULER_ENABLED=false",
+                    "proposals": [], "produced": []}
+        cands = self.ledger.propose_clues(query, limit=max(6, int(max_links) * 2),
+                                          scope_key=scope_key)
+        proposals: List[Dict[str, Any]] = []
+        # 连线：共享概念的候选对提一条 link 提案（影子：不真写 memory_link）
+        tag_sets = []
+        for c in cands:
+            tag_sets.append({t for t in re.split(r"[,，、;；]+", c.get("tags") or "") if t})
+        for i in range(len(cands)):
+            if len(proposals) >= max(1, int(max_links)):
+                break
+            for j in range(i + 1, len(cands)):
+                if len(proposals) >= max(1, int(max_links)):
+                    break
+                shared = tag_sets[i] & tag_sets[j]
+                if not shared:
+                    continue
+                proposals.append({
+                    "kind": "link",
+                    "payload": {"from": cands[i]["id"], "to": cands[j]["id"],
+                                "concept": sorted(shared)[0]},
+                    "basis_ids": [cands[i]["id"], cands[j]["id"]],
+                    "status": "pending",
+                })
+        # 产出：单次最多 DREAM_MAX_OUTPUTS 条，置信上限硬编码在 dream_add_memory 里
+        produced: List[Dict[str, Any]] = []
+        produce = max(0, min(int(produce), DREAM_MAX_OUTPUTS))
+        for _ in range(produce):
+            if len(cands) < 2:
+                break
+            a, b = cands[0], cands[1]
+            basis = [a["id"], b["id"]]
+            # 候选已被锁 1 排除梦产出；这里再防一次（双保险，写入侧也拦）
+            summary = "（梦）大概与「%s」和「%s」有关的一段模糊印象" % (
+                (a.get("summary") or "")[:20], (b.get("summary") or "")[:20])
+            try:
+                res = self.ledger.dream_add_memory(summary, basis_ids=basis)
+            except LedgerError:
+                break  # 产出失败整轮放弃已产出部分不追加（骨架阶段保持简单）
+            produced.append(res)
+        if proposals:
+            self.ledger.dream_apply(proposals, [])
+        return {"skipped": False, "proposals": proposals,
+                "produced": produced, "candidates": len(cands)}

@@ -24,11 +24,11 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS, Ledger,
-                         LedgerError, StaleHeadError)
+    from .ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
+                         Ledger, LedgerError, StaleHeadError, match_denial_keywords)
 except ImportError:  # 直接当脚本跑时
-    from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS, Ledger,
-                        LedgerError, StaleHeadError)
+    from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
+                        Ledger, LedgerError, StaleHeadError, match_denial_keywords)
 
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
 
@@ -127,6 +127,9 @@ class MemoryCommitPlugin(Star):
         self._inject_lines = 0
         # 维护任务节流计数：只有 % MAINTAIN_EVERY == 1 那几轮真去检查
         self._maintain_tick = 0
+        # 本轮用户消息在原文链上的序号（v5 增量原文锚）：memory_write 落库时
+        # 把新记忆锚回这句原话，后续 trace_to_source 能接回去。
+        self._last_user_seq = 0
         try:
             if INJECT_LOG.exists():
                 with open(INJECT_LOG, encoding="utf-8") as f:
@@ -385,8 +388,18 @@ class MemoryCommitPlugin(Star):
         try:
             said = (event.get_message_str() or "").strip()
             if said:
-                self.ledger.append_message(
+                node = self.ledger.append_message(
                     "user", said, session_id=(event.unified_msg_origin or ""))
+                # v5 增量原文锚：记住这句原话的链上序号，本轮若写了记忆就锚回它
+                self._last_user_seq = int(node.get("seq") or 0)
+                # 否认关键词命中 → 只进待确认队列，不自动改状态（v5 §5.1）。
+                # 「你记错了」这种话是线索不是判决，等人或原文对账确认。
+                hits = match_denial_keywords(said)
+                if hits:
+                    try:
+                        self.ledger.queue_denial_suspect(said, keyword=hits[0])
+                    except Exception as e:
+                        logger.warning("[记忆账本] 待确认队列写入失败: %r" % (e,))
         except Exception as e:
             logger.warning("[记忆账本] 原文落链失败: %r" % (e,))
         raw = (getattr(req, "prompt", "") or "").strip()
@@ -543,7 +556,8 @@ class MemoryCommitPlugin(Star):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
         try:
             res = self.ledger.remember(content, level=level or "day", tags=tags,
-                                       importance=float(importance))
+                                       importance=float(importance),
+                                       anchor_seq=self._last_user_seq)
         except LedgerError as e:
             return "没写进去：%s" % e
         return "已写入 %s（提交 %s），标签：%s" % (
@@ -581,6 +595,28 @@ class MemoryCommitPlugin(Star):
         except LedgerError as e:
             return "没删掉：%s" % e
         return "已遗忘 %s（提交 %s）" % (res["memory_id"], res["commit"])
+
+    @filter.llm_tool(name="memory_deny")
+    async def memory_deny(self, event: AstrMessageEvent, memory_id: str,
+                          why: str) -> str:
+        """用户否认了一条记忆（说「你记错了」「没这回事」）时调用：把这条记忆标记为有争议。
+
+        只标记，不删除：否认不等于删，原文还在。被否认的记忆会立刻
+        降低检索权重、不再主动提起。用户只是随口否认某个细节时也可以用。
+
+        Args:
+            memory_id(string): 记忆编号，形如 m12，必须来自 memory_search 的结果
+            why(string): 用户否认的原话或理由，一句话
+        """
+        if not _is_owner(event):
+            return "不可用：记忆账本只在用户和助手的私聊里开放。"
+        try:
+            res = self.ledger.deny_memory(memory_id.strip(), why,
+                                          message_seq=self._last_user_seq)
+        except LedgerError as e:
+            return "没标上：%s" % e
+        return "已标记 %s 为有争议（不再主动提起，不删除）。提交 %s" % (
+            res["memory_id"], self.ledger.head())
 
     @filter.llm_tool(name="memory_profile")
     async def memory_profile(self, event: AstrMessageEvent, fact: str,
