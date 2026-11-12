@@ -5,7 +5,7 @@ author_url: https://github.com/lsby/ai-memory
 description: 带提交链、分层检索与信息冲刷的外置记忆账本，记忆写在插件外部目录，可回溯、可回放。
 desc: 写入只能发生在提交里，父提交必须等于 HEAD；检索走 BM25 + 30 天半衰期，并沿标签连边顺藤摸瓜；一级工作记忆有名额上限，超员按「此刻有多清楚」沉到零级，被反复想起再升回来；沉下去的旧记忆按信息冲刷量降级、最后淘汰。
 repo: local
-version: 1.4.2
+version: 1.5.0
 support_platforms:
   - aiocqhttp
 astrbot_version: ">=4.0.0"
