@@ -18,6 +18,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -50,32 +51,36 @@ OWNER_UMOS = frozenset(x.strip() for x in os.environ.get(
     "JJ_MEMORY_OWNERS", "").split(",") if x.strip())
 
 # 环境变量只有进程启动那一刻读得到，改完必须重启；重启还会把启动前刚写进去的
-# 值一并漏掉（2026-11-11 就是这么断链的）。owners.json 按 mtime 每次复核，
+# 值一并漏掉（2026-11-11 就是这么断链的）。owners.json 每次调用都读一遍，
 # 改完下一轮就生效，两边取并集。
-_OWNERS_CACHE: dict = {"sig": None, "umos": OWNER_UMOS}
+# 缓存按「文件内容」而不是 mtime 判：等长内容在同一时间刻度里改写两次，
+# (st_mtime_ns, st_size) 会一模一样，名单就改不动——那也是「改了不生效」。
+# 这个文件只有几十字节，直接读比赌时间戳便宜。
+_OWNERS_CACHE: dict = {"text": None, "umos": OWNER_UMOS}
 
 
 def _load_owners() -> frozenset:
     try:
-        st = OWNERS_FILE.stat()
-        sig = (st.st_mtime_ns, st.st_size)
+        text = OWNERS_FILE.read_text(encoding="utf-8")
     except OSError:
         return OWNER_UMOS
-    if _OWNERS_CACHE["sig"] == sig:
+    if text == _OWNERS_CACHE["text"]:
         return _OWNERS_CACHE["umos"]
     try:
-        raw = json.loads(OWNERS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
-        logger.warning("owners.json 读不了，暂时只认环境变量：%s" % e)
+        raw = json.loads(text)
+    except ValueError as e:
+        logger.warning("owners.json 解析不了，暂时只认环境变量：%s" % e)
+        _OWNERS_CACHE.update(text=text, umos=OWNER_UMOS)
         return OWNER_UMOS
     if isinstance(raw, dict):
         raw = raw.get("owners", [])
     if not isinstance(raw, list):
         logger.warning("owners.json 期望字符串列表，实际是 %s" % type(raw).__name__)
+        _OWNERS_CACHE.update(text=text, umos=OWNER_UMOS)
         return OWNER_UMOS
     umos = frozenset(set(OWNER_UMOS) | {
         x.strip() for x in raw if isinstance(x, str) and x.strip()})
-    _OWNERS_CACHE.update(sig=sig, umos=umos)
+    _OWNERS_CACHE.update(text=text, umos=umos)
     return umos
 
 
@@ -93,6 +98,41 @@ MAINTAIN_EVERY = max(1, int(os.environ.get("JJ_MEMORY_MAINTAIN_EVERY", "20") or 
 def _short(text: str, n: int = 40) -> str:
     text = " ".join((text or "").split())
     return text if len(text) <= n else text[:n] + "…"
+
+
+# LLM 工具的参数不是人填的表格：可能是 null、数字、带空格的串、甚至
+# 「很高」这种。入库口（ledger）会拦，但拦的方式是抛异常，异常从工具里
+# 溢出去就是整条回复炸掉。所以在这一层先把参数收干净。
+
+def _as_text(value: Any, name: str = "内容", limit: int = 0) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        raise LedgerError("%s不能为空" % name)
+    if limit and len(text) > limit:
+        text = text[:limit]
+    return text
+
+
+def _as_int(value: Any, default: int, low: int = 0, high: int = 0) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    if low:
+        n = max(low, n)
+    if high:
+        n = min(high, n)
+    return n
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return default
+    if n != n or n in (float("inf"), float("-inf")):
+        return default
+    return n
 
 
 def _fmt_hit(m: dict, idx: int = 0) -> str:
@@ -555,9 +595,13 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
         try:
-            res = self.ledger.remember(content, level=level or "day", tags=tags,
-                                       importance=float(importance),
-                                       anchor_seq=self._last_user_seq)
+            lvl = str(level or "day").strip()
+            res = self.ledger.remember(
+                _as_text(content, "要记的内容", limit=4000),
+                level=lvl if lvl in LEVELS else "day",
+                tags=tags if isinstance(tags, (str, list, tuple, set)) else "",
+                importance=_as_float(importance, 0.5),
+                anchor_seq=self._last_user_seq)
         except LedgerError as e:
             return "没写进去：%s" % e
         return "已写入 %s（提交 %s），标签：%s" % (
@@ -574,7 +618,9 @@ class MemoryCommitPlugin(Star):
         """
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
-        hits = self.ledger.recall(query, limit=max(1, min(10, int(limit or 5))))
+        query_text = "" if query is None else str(query).strip()
+        hits = self.ledger.recall(query_text,
+                                  limit=_as_int(limit, 5, low=1, high=10))
         if not hits:
             return "账本里没有相关的记忆。"
         return "\n".join(_fmt_hit(m, i) for i, m in enumerate(hits, 1))
@@ -591,7 +637,8 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
         try:
-            res = self.ledger.forget(memory_id.strip(), reason)
+            res = self.ledger.forget(_as_text(memory_id, "记忆编号"),
+                                     str(reason or ""))
         except LedgerError as e:
             return "没删掉：%s" % e
         return "已遗忘 %s（提交 %s）" % (res["memory_id"], res["commit"])
@@ -611,7 +658,8 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
         try:
-            res = self.ledger.deny_memory(memory_id.strip(), why,
+            res = self.ledger.deny_memory(_as_text(memory_id, "记忆编号"),
+                                          _as_text(why, "否认理由", limit=200),
                                           message_seq=self._last_user_seq)
         except LedgerError as e:
             return "没标上：%s" % e
@@ -630,7 +678,9 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
         try:
-            res = self.ledger.remember_profile("master", fact, category=category)
+            cat = str(category or "event").strip() or "event"
+            res = self.ledger.remember_profile(
+                "master", _as_text(fact, "事实", limit=200), category=cat)
         except LedgerError as e:
             return "没记住：%s" % e
         return "画像已更新（%s）" % res["profile_id"]
