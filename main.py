@@ -619,6 +619,10 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
         query_text = "" if query is None else str(query).strip()
+        # 空检索词不往下走：recall("") 不报错，只会按新鲜度排出一批无关记忆，
+        # 看着像找到了，其实什么都没找。入口直接拦下，把话说清楚。
+        if not query_text:
+            return "检索词是空的，没法翻账本：给个关键词，比如「5433」或「空调」。"
         hits = self.ledger.recall(query_text,
                                   limit=_as_int(limit, 5, low=1, high=10))
         if not hits:
