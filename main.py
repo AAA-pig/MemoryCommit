@@ -151,7 +151,7 @@ def _fmt_hit(m: dict, idx: int = 0) -> str:
     return head + tail
 
 
-@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.4.2")
+@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.5.0")
 class MemoryCommitPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
