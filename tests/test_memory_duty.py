@@ -35,20 +35,24 @@ except ModuleNotFoundError:
 # Ledger 公开方法冻结清单（2026-11-12 v5 改造后实测 54 个）。
 # 契约测试的作用就是钉住「三件事各干各的、不串味」（施工单 §1.1）：
 # 任何人想再加公开方法（尤其写路径），必须先改这个清单并过评审。
+# 2026-11-12 P0 修复新增 3 个，全部只读/库维护，都不是记忆写路径：
+#   recent_messages（读原文链，供自动沉淀）、wal_bytes（读文件大小）、
+#   maybe_checkpoint_wal（PRAGMA wal_checkpoint，不碰提交链与任何投影表）。
 LEDGER_PUBLIC_METHODS = frozenset({
     "access_history", "activate", "anchor_memory", "append_message",
     "classify_pair", "close", "commit", "compact", "current_status",
     "denial_history", "denied_ids", "deny_memory", "deny_revoke", "dream_add_memory",
     "dream_apply", "dream_produced_ids", "dump_jsonl", "export_markdown",
     "flush", "flush_plan", "forget", "head", "health_check", "history",
-    "load_jsonl", "materialize", "max_created_seq", "maybe_export_daily",
-    "maybe_rebalance_working_set", "message_stats", "nominate_node",
-    "pending_denial_queue", "plan_working_set", "profiles", "propose_clues",
-    "prune_access_log", "queue_denial_suspect", "quiet_ids",
-    "rebalance_working_set", "recall", "remember", "remember_profile",
-    "render_brief", "schema_version", "search_messages", "set_memory_condition",
-    "set_memory_status", "show_commit", "stats", "status_timeline", "touch",
-    "touch_many", "trace_to_source", "verify_message_chain", "working_set",
+    "load_jsonl", "materialize", "max_created_seq", "maybe_checkpoint_wal",
+    "maybe_export_daily", "maybe_rebalance_working_set", "message_stats",
+    "nominate_node", "pending_denial_queue", "plan_working_set", "profiles",
+    "propose_clues", "prune_access_log", "queue_denial_suspect", "quiet_ids",
+    "rebalance_working_set", "recall", "recent_messages", "remember",
+    "remember_profile", "render_brief", "schema_version", "search_messages",
+    "set_memory_condition", "set_memory_status", "show_commit", "stats",
+    "status_timeline", "touch", "touch_many", "trace_to_source",
+    "verify_message_chain", "wal_bytes", "working_set",
 })
 
 

@@ -127,6 +127,12 @@ REVIVE_HITS = 2                 # ……这么多次，就让它回到工作记�
 ZERO_GRADE_WEIGHT = 0.45        # 零级在自动激活里的分量：不主动冒头，但没被拉黑
 WORKING_COOLDOWN_SECONDS = 6 * 3600.0  # maybe_rebalance 最短多久真跑一次
 
+# WAL：连接长期持有，读多写少，不 checkpoint 的话 -wal 只涨不落
+# （实测 3.6MB 从不回落）。超过阈值时在已有维护节流里顺手截断一次。
+WAL_CHECKPOINT_BYTES = int(
+    os.environ.get("JJ_MEMORY_WAL_CHECKPOINT_BYTES", str(2 * 1024 * 1024)) or 0)
+WAL_CHECKPOINT_COOLDOWN = 300.0  # 两次 checkpoint 之间至少隔 5 分钟
+
 # 自动压缩：提交数超过这个值就顺手压一次。0 = 关，默认关。
 # 实例上还有同名属性，测试和外壳可以直接改，不用重载模块。
 AUTO_COMPACT_AFTER = int(os.environ.get("JJ_MEMORY_AUTO_COMPACT", "0") or 0)
@@ -1351,6 +1357,9 @@ class Ledger:
         # 工作记忆容量（可被外壳/测试覆盖；0 = 关掉分级运转）
         self.working_capacity = WORKING_CAPACITY
         self._rebalanced_at = 0.0
+        # WAL 截断：阈值可被外壳/测试覆盖，冷却时刻记在这里
+        self.wal_checkpoint_bytes = WAL_CHECKPOINT_BYTES
+        self._checkpointed_at = 0.0
         self._init_schema()
 
     # -- 基础设施 --
@@ -1414,6 +1423,47 @@ class Ledger:
             self._conn.close()
         except Exception:
             pass
+
+    # -- WAL 维护 --
+
+    def wal_bytes(self) -> int:
+        """当前 -wal 文件多大。没有就返回 0。"""
+        path = self.db_path + "-wal"
+        try:
+            return os.path.getsize(path) if os.path.exists(path) else 0
+        except OSError:
+            return 0
+
+    def maybe_checkpoint_wal(self, threshold: Optional[int] = None,
+                             cooldown: float = WAL_CHECKPOINT_COOLDOWN
+                             ) -> Dict[str, Any]:
+        """WAL 超过阈值就截断一次，让 -wal 落回磁盘、别只涨不落。
+
+        挂在已有的维护节流里调用（不新开定时器）。里面有别人在读写时
+        TRUNCATE 可能 busy，那不算错：下一轮再试。
+        """
+        limit = self.wal_checkpoint_bytes if threshold is None else int(threshold)
+        size = self.wal_bytes()
+        if limit <= 0 or size < limit:
+            return {"checkpointed": False, "reason": "wal 未超阈值",
+                    "wal_bytes": size, "threshold": limit}
+        now = time.time()
+        if now - self._checkpointed_at < max(0.0, float(cooldown)):
+            return {"checkpointed": False, "reason": "还在冷却里",
+                    "wal_bytes": size, "threshold": limit}
+        try:
+            with self._lock:
+                row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        except sqlite3.Error as e:
+            log.warning("[记忆账本] WAL 截断失败（不影响读写）: %r", e)
+            return {"checkpointed": False, "reason": str(e),
+                    "wal_bytes": size, "threshold": limit}
+        self._checkpointed_at = now
+        # PRAGMA 返回 (busy, log_pages, checkpointed_pages)
+        busy = int(row[0]) if row else 0
+        return {"checkpointed": bool(not busy), "reason": "busy" if busy else "",
+                "wal_bytes_before": size, "wal_bytes": self.wal_bytes(),
+                "threshold": limit}
 
     def _meta(self, cx: sqlite3.Connection, key: str) -> str:
         row = cx.execute("SELECT v FROM meta WHERE k = ?", (key,)).fetchone()
@@ -2187,10 +2237,14 @@ class Ledger:
         return out
 
     def forget(self, memory_id: str, reason: str = "") -> Dict[str, str]:
-        with self.commit("遗忘：%s" % ((reason or memory_id).strip()[:24])) as c:
-            ok = c.forget(memory_id)
-        if not ok:
+        # 先确认存在再开提交：否则 builder 一行都没记，seal 会抛「空提交」，
+        # 用户看到的是一句「没有任何行变更」，而真正的原因是「没有这条记忆」。
+        memory_id = (memory_id or "").strip()
+        if not memory_id or not self._query_one(
+                "SELECT 1 FROM memory WHERE id = ?", (memory_id,)):
             raise LedgerError("没有这条记忆：%s" % memory_id)
+        with self.commit("遗忘：%s" % ((reason or memory_id).strip()[:24])) as c:
+            c.forget(memory_id)
         return {"commit": self.head(), "memory_id": memory_id}
 
     def remember_profile(self, user_id: str, fact: str,
@@ -2244,6 +2298,17 @@ class Ledger:
             cx.execute("UPDATE meta SET v=? WHERE k='message_no'", (str(n),))
             cx.execute("UPDATE meta SET v=? WHERE k='message_head'", (digest,))
         return {"id": mid, "seq": n, "digest": digest}
+
+    def recent_messages(self, limit: int = 20, after_seq: int = 0
+                        ) -> List[Dict[str, Any]]:
+        """取最近若干条原文（seq 严格大于 after_seq），按时间正序返回。
+
+        给「自动沉淀」用：只读原文链，不参与提交链。
+        """
+        rows = self._query_all(
+            "SELECT seq, role, content, at FROM message WHERE seq > ?"
+            " ORDER BY seq DESC LIMIT ?", (int(after_seq or 0), max(1, int(limit))))
+        return [dict(r) for r in reversed(rows)]
 
     def search_messages(self, query: str = "", limit: int = 10,
                         session_id: str = "", since: str = "",
