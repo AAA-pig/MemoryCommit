@@ -57,8 +57,11 @@ SCHEMA_VERSION = 5
 CORE_API_VERSION = 2
 
 # 可往返导出的文件：格式名 + 文件自身版本（排版变了才 +1）
+# v2（R5）：文件头带每表行数清单与总行数，尾部加 __eof__ 标记；
+# 导入 v2 一律严格校验（坏行/截断/行数不符报错，落库前先在临时库预演），
+# v1 老备份保持宽容兼容（坏行跳过计数）。
 DUMP_FORMAT = "jj-memory-dump"
-DUMP_VERSION = 1
+DUMP_VERSION = 2
 
 # 搬家时要带走的表，顺序按「先元信息、后投影」，导入时不会因为顺序互相绊住
 DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
@@ -798,6 +801,67 @@ def classify_conflict(a_summary: str, b_summary: str,
     return CONFLICT_UNDETERMINED
 
 
+# --------------------------------------------------------------------------
+# coexist 条件判定（R3）
+#
+# disputed 是「永远不主动提」；coexist 只是「条件不匹配时不主动提」，
+# 条件匹配就该能正常浮现。条件存在 memory_condition 的 cond_json
+# （字段同 classify_conflict：scene / window / env）。
+# 判定原则只有一条：判得出且全部匹配才放行，判不出一律保守拦。
+# --------------------------------------------------------------------------
+
+CONDITION_KEYS = ("scene", "window", "env")
+
+
+def _ctx_time(value: Any) -> float:
+    """语境里的时间值 → 时间戳；解析不出返回 0（调用方按「判不出」处理）。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        return _parse_time_cached(value.strip()[:19])
+    return 0.0
+
+
+def condition_allows(cond_json: Any, context: Any) -> bool:
+    """coexist 的条件在当前语境下是否成立（True 才许主动浮现）。
+
+    判不出一律 False，不许「判不出就放行」：
+      - context 缺席 / 不是对象 / 是空的 —— 没有语境无从判起
+      - cond_json 空、坏 JSON、解析出来不是对象 —— 没有条件可判
+      - cond 里出现 scene/window/env 之外的字段 —— 字段不认识，语义未知
+      - 认识的字段缺对应语境数据（要场景没场景、要时间没时间、要环境没环境）
+      - cond 所有字段都是空值 —— 等于没写条件，同样判不出
+    条件写全且逐项匹配，才放行。
+    """
+    cond = parse_condition(cond_json)
+    if not cond or not isinstance(context, dict) or not context:
+        return False
+    if any(k not in CONDITION_KEYS for k in cond):
+        return False
+    scene = str(cond.get("scene") or "").strip()
+    window = _condition_part(cond, "window")
+    env = _condition_part(cond, "env")
+    if not scene and not window and not env:
+        return False
+    if scene:
+        ctx_scene = str(context.get("scene") or "").strip()
+        if not ctx_scene or ctx_scene != scene:
+            return False
+    if window:
+        now_ts = _ctx_time(context.get("now"))
+        f_ts = _ctx_time(window.get("from"))
+        t_ts = _ctx_time(window.get("to"))
+        if not (now_ts and f_ts and t_ts):
+            return False
+        if not (f_ts <= now_ts <= t_ts):
+            return False
+    if env:
+        ctx_env = context.get("env")
+        if not isinstance(ctx_env, dict) or ctx_env != env:
+            return False
+    return True
+
+
 def match_denial_keywords(text: str,
                           keywords: Iterable[str] = DENIAL_KEYWORDS) -> List[str]:
     """用户话里命中的否认关键词。命中只进待确认队列，不自动改状态。"""
@@ -1279,14 +1343,23 @@ class CommitBuilder:
             return False
         for rel in self.ledger._query_all(
                 "SELECT * FROM memory_clue WHERE memory_id = ?", (memory_id,)):
+            # 删除行必须自带完整行身份（where + before 全字段）：
+            # 重放时先解 row_key，before 里缺了身份也能对上号（R4）
             self._push("memory_clue", "delete",
                        {"memory_id": memory_id, "clue_id": rel["clue_id"]},
-                       {"weight": rel["weight"], "note": rel["note"]}, None)
+                       {"memory_id": memory_id, "clue_id": rel["clue_id"],
+                        "weight": rel["weight"], "note": rel["note"]}, None)
         for link in self.ledger._query_all(
                 "SELECT * FROM memory_link WHERE from_id = ? OR to_id = ?",
                 (memory_id, memory_id)):
-            self._push("memory_link", "delete", {"id": link["id"]},
-                       {"concept": link["concept"], "strength": link["strength"]}, None)
+            # 行主键是 from|to|concept（见 PROJECTIONS），where 必须用它，
+            # 不能只写 id——否则重放解 row_key 时认不出删的是哪条边（R4）
+            self._push("memory_link", "delete",
+                       {"from_id": link["from_id"], "to_id": link["to_id"],
+                        "concept": link["concept"]},
+                       {"id": link["id"], "from_id": link["from_id"],
+                        "to_id": link["to_id"], "concept": link["concept"],
+                        "strength": link["strength"]}, None)
         self._push("memory", "delete", {"id": memory_id}, snap, None)
         return True
 
@@ -1331,6 +1404,23 @@ class CommitBuilder:
 # --------------------------------------------------------------------------
 # 账本
 # --------------------------------------------------------------------------
+
+def _row_key_fields(row_key: str) -> Dict[str, str]:
+    """把 commit_row.row_key（"k=v|k=v"）解回行身份字段。
+
+    删除事件的 after 恒为空，旧数据的 before 快照又可能缺身份字段
+    （R4：老版 forget 只存了 weight/note），row_key 是唯一可靠的行身份来源。
+    解析不出来就返回空 dict，让调用方退回 before。基线行的 row_key 带
+    "baseline:" 前缀且 op 恒为 insert，不进这条路径。
+    """
+    out: Dict[str, str] = {}
+    for kv in (row_key or "").split("|"):
+        if "=" in kv:
+            k, _, v = kv.partition("=")
+            if k:
+                out[k] = v
+    return out
+
 
 class Ledger:
     ASSOC_DEPTH = 2  # 联想最多走两步：想到的事，还想得起它连着的事
@@ -1826,6 +1916,9 @@ class Ledger:
                     nrow = self._query_one("SELECT * FROM memory WHERE id = ?", (nid,))
                     if not nrow:
                         continue
+                    # scope 贯穿每一跳扩散（R6）：显式检索里，邻层也不跨会话
+                    if scope_key and (nrow["scope_key"] or "") not in ("", scope_key):
+                        continue
                     nrow = dict(nrow)
                     cand = seed["score"] * 0.35 * float(link["strength"]) * \
                         time_decay(nrow["created_at"], half_life_days,
@@ -1833,7 +1926,7 @@ class Ledger:
                     if nid in scored:
                         scored[nid]["score"] = round(max(scored[nid]["score"], cand), 5)
                         scored[nid]["match"] = "graph"
-                    else:
+                    else:  # pragma: no cover —— 防御网：候选池与单查在并发写下不一致时兜住邻居
                         nrow.update({"bm25": 0.0,
                                      "decay": round(time_decay(nrow["created_at"], HALF_LIFE_DAYS,
                                                                nrow.get("access_count", 0)), 4),
@@ -1911,12 +2004,14 @@ class Ledger:
         for r in rows:
             r["clues"] = clue_map.get(r["id"], [])
 
-    def _clue_bridge(self, query: str, limit: int = 6) -> List[Dict[str, Any]]:
+    def _clue_bridge(self, query: str, limit: int = 6,
+                     scope_key: str = "") -> List[Dict[str, Any]]:
         """一个词先撞上「线索」，线索再把挂着它的记忆牵出来。
 
         ai-memory 里联想的主路走的是线索，不是记忆连记忆：
         查询 → 线索 → 记忆。稀有线索权重高，所以「空调」能牵出具体的事，
         而「日常」这种满地都是的线索牵不动什么。
+        scope_key 非空时，牵出的记忆限制在该会话（或全局共享 scope_key=''）。
         """
         q_tokens = set(tokenize(query))
         if not q_tokens:
@@ -1951,6 +2046,8 @@ class Ledger:
                 mem = self._query_one("SELECT * FROM memory WHERE id = ?", (mid,))
                 if not mem:
                     continue
+                if scope_key and (mem["scope_key"] or "") not in ("", scope_key):
+                    continue
                 seen.add(mid)
                 cand = dict(mem)
                 cand["decay"] = round(time_decay(cand["created_at"], HALF_LIFE_DAYS,
@@ -1965,18 +2062,20 @@ class Ledger:
         return out
 
     def _fresh_candidates(self, limit: int = 12,
-                          scope_key: str = "") -> List[Dict[str, Any]]:
+                          scope_key: str = "",
+                          context: Optional[dict] = None) -> List[Dict[str, Any]]:
         """没人问起时，哪些记忆有资格自己冒出来：新鲜 × 重要 × 巩固。
 
-        v5 职守过滤：disputed（被否认，停止主动提起）与 coexist（条件并存，
-        条件不匹配时不主动提）不进主动浮现池；显式检索（recall）仍找得到。
+        v5 职守过滤：disputed（被否认，停止主动提起）不进主动浮现池；
+        coexist（条件并存）给语境且条件匹配才进（R3），判不出/不匹配不进；
+        显式检索（recall）仍找得到。
         """
         sql = "SELECT * FROM memory"
         params: Tuple[Any, ...] = ()
         if scope_key:
             sql += " WHERE scope_key = ? OR scope_key = ''"
             params = (scope_key,)
-        quiet = self.quiet_ids()
+        quiet = self.quiet_ids(context)
         out: List[Dict[str, Any]] = []
         for row in self._query_all(sql, params):
             r = dict(row)
@@ -2000,7 +2099,8 @@ class Ledger:
                  scope_key: str = "",
                  user_id: str = "master", cooldown_min: float = 25.0,
                  with_profile: bool = True,
-                 dry_run: bool = False) -> Dict[str, Any]:
+                 dry_run: bool = False,
+                 context: Optional[dict] = None) -> Dict[str, Any]:
         """聊天前的一次「唤起」。
 
         三条路依次补位：
@@ -2010,6 +2110,8 @@ class Ledger:
         冷却期内刚浮现过的记忆不再重复出现，免得每轮都念同一件事。
 
         slots 是「这一轮最多说出口几条」，只影响注入，不影响谁留在工作记忆里。
+        context 是当前语境（会话场景、当前时间等，R3）：coexist 记忆只在
+        条件判定为匹配时放行；传 None 时判不出条件，coexist 全部保守拦。
         """
         query = (query or "").strip()
         slots = normalize_limit(slots, DEFAULT_INJECT_SLOTS)
@@ -2018,6 +2120,11 @@ class Ledger:
         picked: List[Dict[str, Any]] = []
         seen = set()
         routes: List[str] = []
+        # 候选接纳统一入口的可见性与状态策略（R3）：disputed（被否认）五条路线
+        # （direct / clue / graph / fresh / fallback）永久拦；coexist（条件并存）
+        # 只在语境能判定且条件匹配时放行，判不出/不匹配同样拦。
+        # 显式检索 recall 不受此限，仍能找到但 disputed 降权。
+        quiet = self.quiet_ids(context)
 
         def take(rows: Iterable[Dict[str, Any]], route: str,
                  cap: Optional[int] = None, force: bool = False) -> bool:
@@ -2027,7 +2134,7 @@ class Ledger:
                 if len(picked) >= cap:
                     break
                 mid = row["id"]
-                if mid in seen or (not force
+                if mid in seen or mid in quiet or (not force
                                    and now - self._surfaced.get(mid, 0.0) < cooldown):
                     continue
                 r = dict(row)
@@ -2047,10 +2154,10 @@ class Ledger:
                     if h.get("bm25", 0) > 0 or str(h.get("match", "")).startswith("clue:")]
             take(hits, "search")
 
-        # 线索桥：一个词先撞上线索，再顺着线索牵出记忆
+        # 线索桥：一个词先撞上线索，再顺着线索牵出记忆（scope 贯穿，R6）
         flashes: List[str] = []
         if query and len(picked) < slots:
-            for cand in self._clue_bridge(query, slots * 3):
+            for cand in self._clue_bridge(query, slots * 3, scope_key):
                 if len(picked) >= slots:
                     break
                 before = len(picked)
@@ -2079,6 +2186,9 @@ class Ledger:
                         row = self._query_one("SELECT * FROM memory WHERE id = ?", (nid,))
                         if not row:
                             continue
+                        # scope 贯穿每一跳扩散（R6）：连边一跳也不能跨会话
+                        if scope_key and (row["scope_key"] or "") not in ("", scope_key):
+                            continue
                         walked.add(nid)
                         cand = dict(row)
                         cand["match"] = "graph:" + link["concept"]
@@ -2101,7 +2211,7 @@ class Ledger:
         # 不会把 420 预算塞满），route 单独标 fallback，让注入日志能区分「正常激活」
         # 和「检索落空后的兜底」，绝不伪装成 search/activate。冷却照常生效。
         if not query and len(picked) < slots:
-            take(self._fresh_candidates(slots * 4, scope_key), "activate")
+            take(self._fresh_candidates(slots * 4, scope_key, context), "activate")
         elif query and not picked:
             # 进兜底分支就无条件记一条 route：让注入日志分得清「没走兜底」和
             # 「兜底被冷却挡光」，别再拿 route=none 顶替、搞得 17 行 no_hit
@@ -2111,7 +2221,7 @@ class Ledger:
             # 第一名 m6 刚进冷却就直接 route=none、items=[]，而 m2/m1/m5/m7
             # 明明还能用。池子给大（slots*3，至少 6），让不在冷却的候选能进来；
             # 但真正注入的仍只取 slots//2 条，保住 420 预算不被塞满。
-            candidates = self._fresh_candidates(max(slots * 3, 6), scope_key)
+            candidates = self._fresh_candidates(max(slots * 3, 6), scope_key, context)
             took = take(candidates, "fallback", cap=max(1, slots // 2))
             if not took and len(candidates) >= 2:
                 # 候选全在冷却里（还不止一条）：允许取「最久没露面」的 1 条
@@ -2668,7 +2778,15 @@ class Ledger:
                 elif r["op"] == "update" and after and key in bucket:
                     bucket[key].update(after)
                 elif r["op"] == "delete":
-                    bucket.pop(key, None)
+                    # 删除事件的行身份：先解 row_key（k=v|k=v），再用 before 补
+                    # 其余字段。老数据 before 只存了部分字段（R4），光靠它会
+                    # 把 key 算成 None 拼接，pop 不掉真实行、回放里出幽灵。
+                    snap: Dict[str, Any] = dict(_row_key_fields(r["row_key"]))
+                    if before:
+                        snap.update(before)
+                    key = key_of(snap)
+                    if key is not None:
+                        bucket.pop(key, None)
             if c["id"] == target:
                 break
         return state
@@ -2779,14 +2897,38 @@ class Ledger:
             latest[mid] = DENY_STICKY_STATUS
         return latest
 
-    def denied_ids(self) -> set:
-        """被用户否认（最新档 disputed）的记忆集合。"""
+    def _coexist_cond_json(self, memory_id: str) -> Any:
+        """这条记忆最新一条 coexist 条件原文（没有就空串）。"""
+        row = self._query_one(
+            "SELECT cond_json FROM memory_condition WHERE memory_id = ?"
+            " ORDER BY created_at DESC LIMIT 1", (memory_id,))
+        return row["cond_json"] if row else ""
+
+    def disputed_ids(self) -> set:
+        """disputed（被用户否认）的记忆集合：R3 语义里它是唯一
+        「永远不主动提」的档，不吃条件豁免。"""
         return {m for m, s in self._latest_status_map().items() if s == "disputed"}
 
-    def quiet_ids(self) -> set:
-        """不主动浮现的记忆集合：disputed（停止主动提起）+ coexist（条件不匹配不主动提）。"""
-        return {m for m, s in self._latest_status_map().items()
-                if s in ("disputed", "coexist")}
+    def denied_ids(self) -> set:
+        """被用户否认（最新档 disputed）的记忆集合。disputed_ids 的旧名。"""
+        return self.disputed_ids()
+
+    def quiet_ids(self, context: Optional[dict] = None) -> set:
+        """不主动浮现的记忆集合。
+
+        disputed 永远拦；coexist 只在「给了语境且条件判定为匹配」时放行。
+        context=None（默认）是兼容旧调用的薄封装：没有语境就判不出条件，
+        coexist 全部拦（保守）。条件怎么判见 condition_allows()。
+        """
+        status_map = self._latest_status_map()
+        out = {m for m, s in status_map.items() if s == "disputed"}
+        coexist = {m for m, s in status_map.items() if s == "coexist"}
+        if not coexist:
+            return out
+        if context is None:
+            return out | coexist
+        return out | {m for m in coexist
+                      if not condition_allows(self._coexist_cond_json(m), context)}
 
     def dream_produced_ids(self) -> set:
         """梦产出的记忆集合。真值在 dream_proposal（kind='new_memory'）里——
@@ -3022,8 +3164,8 @@ class Ledger:
     # -- 梦产出与梦的写路径 --
 
     def dream_add_memory(self, summary: str, basis_ids: Iterable[str] = (),
-                         tags: Any = "", importance: float = DREAM_CONFIDENCE_CAP
-                         ) -> Dict[str, Any]:
+                         tags: Any = "", importance: float = DREAM_CONFIDENCE_CAP,
+                         scope_key: str = "") -> Dict[str, Any]:
         """梦产出一条新记忆（v5 §2.1 允许，不是污染）。
 
         硬约束（全部硬编码，不可配置调高）：
@@ -3033,6 +3175,8 @@ class Ledger:
         - tags 剔除保护标签、level 恒为 day、grade 从 0 起：永不进 no_cold 白名单
         - 单次梦最多产出 DREAM_MAX_OUTPUTS=2 条（DreamWorker.run_once 控制）
         - 永不进 no_cold、永不可升为节点（nominate_node 拒绝）
+        - scope_key 必须由调用方显式传入（R6）：不再无脑落全局共享域；
+          传空串就是显式决定「这条梦全局可见」，不是默认行为。
         """
         basis = [b.strip() for b in (basis_ids or []) if str(b).strip()]
         dream_ids = self.dream_produced_ids()
@@ -3050,7 +3194,8 @@ class Ledger:
         proposal_id = self._new_proposal_id()
         builder = self.commit("梦产出（低置信，可删）：" + summary[:24])
         mid = builder.add_memory(summary, level="day", tags=tag_list,
-                                 importance=importance, grade=0)
+                                 importance=importance, grade=0,
+                                 scope_key=(scope_key or "").strip())
         payload = json.dumps({"memory_id": mid, "summary": summary[:400],
                               "importance": importance, "basis_ids": basis},
                              ensure_ascii=False)
@@ -3167,16 +3312,12 @@ class Ledger:
         和 export_markdown 是两件事：那个给人翻，丢了也只丢阅读体验；
         这个给机器搬家，少了任何一张表都会让提交链对不上。
 
-        第一行是文件头，之后一行一条记录：{"t": 表名, "r": 行}。
+        第一行是文件头（含每表行数清单与总行数），之后一行一条记录：
+        {"t": 表名, "r": 行}，最后一行是 {"t": "__eof__"} 尾部标记——
+        导入时拿这些校验文件完整性，被截断的备份直接拒绝（R5）。
         """
-        header = {
-            "format": DUMP_FORMAT,
-            "version": DUMP_VERSION,
-            "schema_version": self.schema_version(),
-            "core_api_version": CORE_API_VERSION,
-            "dumped_at": now_str(),
-        }
-        chunks = [json.dumps(header, ensure_ascii=False, sort_keys=True)]
+        body: List[str] = []
+        counts: Dict[str, int] = {}
         # 导出一律走一把锁：中途被人写进来，导出的就是半截账本
         with self._lock:
             for tbl in DUMP_TABLES:
@@ -3184,13 +3325,29 @@ class Ledger:
                 sql = "SELECT * FROM %s" % tbl
                 if order:
                     sql += " ORDER BY " + order
+                n = 0
                 for row in self._query_all(sql):
                     data = dict(row)
                     if tbl == "meta" and data.get("k") in _LOCAL_META:
                         continue
-                    chunks.append(json.dumps({"t": tbl, "r": data},
-                                             ensure_ascii=False, sort_keys=True))
-        text = "\n".join(chunks) + "\n"
+                    body.append(json.dumps({"t": tbl, "r": data},
+                                           ensure_ascii=False, sort_keys=True))
+                    n += 1
+                counts[tbl] = n
+        total = sum(counts.values())
+        header = {
+            "format": DUMP_FORMAT,
+            "version": DUMP_VERSION,
+            "schema_version": self.schema_version(),
+            "core_api_version": CORE_API_VERSION,
+            "dumped_at": now_str(),
+            "tables": counts,
+            "rows_total": total,
+        }
+        eof = json.dumps({"t": "__eof__", "rows_total": total},
+                         ensure_ascii=False, sort_keys=True)
+        text = "\n".join([json.dumps(header, ensure_ascii=False, sort_keys=True)]
+                         + body + [eof]) + "\n"
         if path:
             target = os.path.abspath(path)
             os.makedirs(os.path.dirname(target), exist_ok=True)
@@ -3203,11 +3360,68 @@ class Ledger:
     def _table_columns(self, cx: sqlite3.Connection, tbl: str) -> List[str]:
         return [r["name"] for r in cx.execute("PRAGMA table_info(%s)" % tbl).fetchall()]
 
-    def load_jsonl(self, path: str, replace: bool = False) -> Dict[str, Any]:
+    def _write_dump_rows(self, cx: sqlite3.Connection,
+                         rows: Dict[str, List[Dict[str, Any]]]
+                         ) -> Tuple[int, List[str]]:
+        """把解析好的备份行灌进一个连接（正式落库与临时库预演共用）。"""
+        written = 0
+        dropped_cols: List[str] = []
+        for tbl in DUMP_TABLES:
+            valid = set(self._table_columns(cx, tbl))
+            for row in rows.get(tbl, []):
+                cols = [c for c in row if c in valid]
+                if len(cols) != len(row):
+                    dropped_cols.extend(
+                        "%s.%s" % (tbl, c) for c in row if c not in valid)
+                if not cols:
+                    continue
+                sql = "INSERT OR REPLACE INTO %s (%s) VALUES (%s)" % (
+                    tbl, ", ".join(cols), ", ".join("?" * len(cols)))
+                cx.execute(sql, tuple(row[c] for c in cols))
+                written += 1
+        return written, dropped_cols
+
+    def _rehearse_restore(self, rows: Dict[str, List[Dict[str, Any]]]) -> None:
+        """恢复预演（R5）：先灌进一个临时库，health_check 通过才算数。
+
+        原库全程不写。临时库用完就删，失败也会带着原因离开。
+        """
+        tmp_path = self.db_path + ".restore-check"
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                if os.path.exists(tmp_path + suffix):
+                    os.remove(tmp_path + suffix)
+            except OSError:
+                pass
+        check = Ledger(tmp_path)
+        try:
+            with check._tx() as cx:
+                check._write_dump_rows(cx, rows)
+            hc = check.health_check()
+            if not hc["ok"]:
+                raise LedgerError(
+                    "恢复预演没通过，原库未动：%s"
+                    % "；".join(hc["problems"][:6]))
+        finally:
+            check.close()
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    if os.path.exists(tmp_path + suffix):
+                        os.remove(tmp_path + suffix)
+                except OSError:
+                    pass
+
+    def load_jsonl(self, path: str, replace: bool = False,
+                   strict: bool = False) -> Dict[str, Any]:
         """把 dump_jsonl 的产物灌回来。
 
         默认只肯往空库里灌：覆盖是有代价的操作，不该是默认行为，
         想覆盖得自己说 replace=True。
+
+        完整性策略（R5）：v2 及以后的备份自带行数清单与尾部 __eof__ 标记，
+        导入一律严格——坏行、截断、行数对不上直接报错，落库前先在临时库
+        预演一遍 health_check，通过才切换。v1 老备份（没有清单）保持宽容
+        兼容：坏行跳过计数。strict=True 可以对老备份也强制严格。
         """
         if not path or not os.path.exists(path):
             raise LedgerError("找不到要导入的文件：%s" % path)
@@ -3230,20 +3444,58 @@ class Ledger:
             raise LedgerError("备份来自结构版本 %s，比当前代码支持的 %d 新" % (
                 header.get("schema_version"), SCHEMA_VERSION))
 
+        strict_mode = bool(strict) or int(header.get("version") or 0) >= 2
         rows: Dict[str, List[Dict[str, Any]]] = {}
         skipped = 0
-        for ln in lines[1:]:
-            try:
-                item = json.loads(ln)
-            except json.JSONDecodeError:
-                skipped += 1
-                continue
-            tbl = item.get("t") if isinstance(item, dict) else None
-            row = item.get("r") if isinstance(item, dict) else None
-            if tbl not in DUMP_TABLES or not isinstance(row, dict):
-                skipped += 1
-                continue
-            rows.setdefault(tbl, []).append(row)
+        eof_seen = not strict_mode  # 宽容模式不要求尾部标记
+        for idx, ln in enumerate(lines[1:], start=2):
+            if strict_mode:
+                try:
+                    item = json.loads(ln)
+                except json.JSONDecodeError as e:
+                    raise LedgerError("备份第 %d 行不是合法 JSON（文件可能损坏）：%s"
+                                      % (idx, e))
+                if not isinstance(item, dict):
+                    raise LedgerError("备份第 %d 行不是 JSON 对象" % idx)
+                tbl = item.get("t")
+                if tbl == "__eof__":
+                    eof_seen = True
+                    break
+                if tbl not in DUMP_TABLES or not isinstance(item.get("r"), dict):
+                    raise LedgerError("备份第 %d 行的表名不认识：%r" % (idx, tbl))
+                rows.setdefault(tbl, []).append(item["r"])
+            else:
+                try:
+                    item = json.loads(ln)
+                except json.JSONDecodeError:
+                    skipped += 1
+                    continue
+                tbl = item.get("t") if isinstance(item, dict) else None
+                if tbl == "__eof__":
+                    break
+                row = item.get("r") if isinstance(item, dict) else None
+                if tbl not in DUMP_TABLES or not isinstance(row, dict):
+                    skipped += 1
+                    continue
+                rows.setdefault(tbl, []).append(row)
+
+        if strict_mode and not eof_seen:
+            raise LedgerError("备份缺尾部结束标记（__eof__）：文件被截断，拒绝导入")
+
+        if strict_mode:
+            want_total = int(header.get("rows_total") or -1)
+            want_tables = header.get("tables") or {}
+            got_tables = {t: len(v) for t, v in rows.items()}
+            got_total = sum(got_tables.values())
+            if want_total >= 0 and got_total != want_total:
+                raise LedgerError(
+                    "备份总行数对不上：清单 %d，实际 %d（文件可能被截断）"
+                    % (want_total, got_total))
+            for t, n in want_tables.items():
+                if got_tables.get(t, 0) != int(n):
+                    raise LedgerError(
+                        "备份 %s 表行数对不上：清单 %d，实际 %d"
+                        % (t, int(n), got_tables.get(t, 0)))
 
         if not rows.get("memory") and not rows.get("mcommit"):
             # 空账本的备份也是合法备份，照收；真正损坏的文件连文件头都过不了
@@ -3254,25 +3506,15 @@ class Ledger:
             raise LedgerError(
                 "这个库已经有 %d 个提交，不覆盖。真想替换就传 replace=True" % existing)
 
-        written = 0
-        dropped_cols: List[str] = []
+        if strict_mode:
+            # 恢复在临时库验证通过再切换（R5）：预演失败原库一字节不动
+            self._rehearse_restore(rows)
+
         with self._tx() as cx:
             if replace:
                 for tbl in reversed(DUMP_TABLES):
                     cx.execute("DELETE FROM %s" % tbl)
-            for tbl in DUMP_TABLES:
-                valid = set(self._table_columns(cx, tbl))
-                for row in rows.get(tbl, []):
-                    cols = [c for c in row if c in valid]
-                    if len(cols) != len(row):
-                        dropped_cols.extend(
-                            "%s.%s" % (tbl, c) for c in row if c not in valid)
-                    if not cols:
-                        continue
-                    sql = "INSERT OR REPLACE INTO %s (%s) VALUES (%s)" % (
-                        tbl, ", ".join(cols), ", ".join("?" * len(cols)))
-                    cx.execute(sql, tuple(row[c] for c in cols))
-                    written += 1
+            written, dropped_cols = self._write_dump_rows(cx, rows)
 
         # 导回来的库可能来自更老的版本，这里补一步；也可能是更新的库，那就已经拦过了
         migrated = self._migrate()
@@ -3292,6 +3534,7 @@ class Ledger:
             "head": head,
             "memories": self.stats()["memories"],
             "warnings": warnings,
+            "verified": strict_mode,
         }
 
     def maybe_export_daily(self, path: str = "") -> bool:
@@ -3338,6 +3581,48 @@ class Ledger:
         last = self.show_commit(st["head"]) if st["head"] else None
         if st["head"] and not last:
             problems.append("HEAD %s 在提交表里找不到" % st["head"])
+
+        # 2.5 投影对账（R4）：提交链重放到 HEAD，每一张可重放投影表
+        #     都要和当前表逐行一致（访问痕迹缓存列除外，它们不进提交链）。
+        #     以前只查 HEAD 在不在，幽灵行 / 漏行的漂移全靠运气。
+        #     对账范围是「链里管过的表」：commit_row 里压根没出现过的表
+        #     （迁移库、外部直插）本来就不是链生成的，不拿链去硬对。
+        try:
+            replay = self._replay_tables(st["head"]) if st["head"] else {}
+        except Exception as e:
+            problems.append("投影重放失败：%r" % (e,))
+            replay = {}
+        chain_tables = {r["tbl"] for r in
+                        self._query_all("SELECT DISTINCT tbl FROM commit_row")}
+        for tbl, key_of in PROJECTIONS.items():
+            if tbl not in chain_tables:
+                continue
+            # memory 的访问缓存列不进提交链；memory_link 的插入快照
+            # 历来不含自增 id（行身份是 from|to|concept），对账时两边都剔除
+            ignore = (STATE_ONLY_COLUMNS if tbl == "memory"
+                      else ("id",) if tbl == "memory_link" else ())
+            cur: Dict[Any, Dict[str, Any]] = {}
+            for row in self._query_all("SELECT * FROM %s" % tbl):
+                d = {k: v for k, v in dict(row).items() if k not in ignore}
+                k = key_of(d)
+                if k is not None:
+                    cur[k] = d
+            rep: Dict[Any, Dict[str, Any]] = {}
+            for k, d in replay.get(tbl, {}).items():
+                if k is None:
+                    continue
+                rep[k] = {kk: vv for kk, vv in d.items() if kk not in ignore}
+            if cur == rep:
+                continue
+            extra = sorted(str(k) for k in cur.keys() - rep.keys())[:3]
+            missing = sorted(str(k) for k in rep.keys() - cur.keys())[:3]
+            changed = sorted(str(k) for k in cur.keys() & rep.keys()
+                             if cur[k] != rep[k])[:3]
+            problems.append(
+                "投影对账不一致：%s 当前 %d 行 / 重放 %d 行"
+                "（当前多 %s；重放多 %s；内容不同 %s）"
+                % (tbl, len(cur), len(rep),
+                   extra or "无", missing or "无", changed or "无"))
 
         # 3. 计数：记忆数与提交行数不该互相矛盾
         mem_rows = self._query_one("SELECT COUNT(*) AS n FROM memory")["n"]
@@ -3410,6 +3695,10 @@ class DreamWorker:
         produce 是本轮最多产出几条模糊新记忆，硬顶 DREAM_MAX_OUTPUTS=2；
         骨架阶段的产出来自候选前两条的组合占位（模糊印象），
         真正的产出质量等开关打开后由宿主侧策略喂进来。
+
+        原子性边界（R7）：单条产出自身是原子的（登记与记忆插入同事务），
+        整轮不承诺原子——中途失败时已落地部分保留，不再向外抛异常，
+        返回值里 partial=True 且 errors 逐条列出失败点，部分成功必须显式可见。
         """
         if not self.enabled:
             return {"skipped": True, "reason": "DREAM_SCHEDULER_ENABLED=false",
@@ -3439,6 +3728,7 @@ class DreamWorker:
                 })
         # 产出：单次最多 DREAM_MAX_OUTPUTS 条，置信上限硬编码在 dream_add_memory 里
         produced: List[Dict[str, Any]] = []
+        errors: List[str] = []
         produce = max(0, min(int(produce), DREAM_MAX_OUTPUTS))
         for _ in range(produce):
             if len(cands) < 2:
@@ -3449,11 +3739,18 @@ class DreamWorker:
             summary = "（梦）大概与「%s」和「%s」有关的一段模糊印象" % (
                 (a.get("summary") or "")[:20], (b.get("summary") or "")[:20])
             try:
-                res = self.ledger.dream_add_memory(summary, basis_ids=basis)
-            except LedgerError:
-                break  # 产出失败整轮放弃已产出部分不追加（骨架阶段保持简单）
+                res = self.ledger.dream_add_memory(summary, basis_ids=basis,
+                                                   scope_key=scope_key)
+            except LedgerError as e:
+                # 单条失败不再无声打断：记下失败点，已产出的保留（部分成功，R7）
+                errors.append("产出失败：%s" % e)
+                break
             produced.append(res)
         if proposals:
-            self.ledger.dream_apply(proposals, [])
+            try:
+                self.ledger.dream_apply(proposals, [])
+            except LedgerError as e:
+                errors.append("提案落地失败：%s" % e)
         return {"skipped": False, "proposals": proposals,
-                "produced": produced, "candidates": len(cands)}
+                "produced": produced, "candidates": len(cands),
+                "errors": errors, "partial": bool(errors)}

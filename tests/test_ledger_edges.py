@@ -328,12 +328,15 @@ def test_recall_clue_only_branch(led):
 
 def test_recall_graph_branches(led):
     m1 = led.remember("空调开 26 度", tags="甲", scope_key="s1")["memory_id"]
-    m2 = led.remember("另一件不相干的事", tags="甲", scope_key="s2")["memory_id"]
+    m2 = led.remember("另一件不相干的事", tags="甲", scope_key="s1")["memory_id"]
+    m3 = led.remember("别的会话的邻居", tags="甲", scope_key="s2")["memory_id"]
     # 指向不存在的记忆：跳过（continue）
     _sql(led, "INSERT INTO memory_link(from_id, to_id, concept, strength, created_at)"
               " VALUES(?,?,?,?,?)", (m1, "m999", "幽灵", 1.0, L.now_str()))
     hits = led.recall("空调", scope_key="s1", min_score=0.0)
-    assert any(h["id"] == m2 for h in hits)
+    ids = {h["id"] for h in hits}
+    assert m2 in ids, "同会话邻居仍沿边带出"
+    assert m3 not in ids, "跨会话邻居不再经一跳扩散带出（R6）"
 
 
 def test_clue_hits_empty_and_no_memory(led):
@@ -576,6 +579,7 @@ def test_load_jsonl_errors(tmp_path, led):
 
 
 def test_load_jsonl_skips_bad_rows_and_reports(tmp_path):
+    """v1 老备份（无完整性清单）保持宽容：坏行跳过计数，不炸整次导入。"""
     target = tmp_path / "t.db"
     src = L.Ledger(str(tmp_path / "src.db"))
     src.remember("搬家用的一条")
@@ -583,9 +587,14 @@ def test_load_jsonl_skips_bad_rows_and_reports(tmp_path):
     src.close()
 
     lines = text.strip().splitlines()
+    header = json.loads(lines[0])
+    header["version"] = 1  # 老格式：走宽容路径（v2 严格路径见 test_r_fixes.py）
+    header.pop("tables", None)
+    header.pop("rows_total", None)
+    lines[0] = json.dumps(header, ensure_ascii=False, sort_keys=True)
     lines.insert(1, "不是 JSON")
     lines.insert(2, json.dumps({"t": "nope", "r": {}}))
-    lines.append(json.dumps({"t": "memory", "r": {"zzz": 1}}))
+    lines.insert(len(lines) - 1, json.dumps({"t": "memory", "r": {"zzz": 1}}))
     dump = tmp_path / "dump.jsonl"
     dump.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
