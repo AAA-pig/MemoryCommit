@@ -34,6 +34,9 @@ except ImportError:  # 直接当脚本跑时
                         tokenize)
 
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
+# 版本号单一来源是 metadata.yaml；这里与之保持一致（一致性由
+# tests/test_r_fixes.py::test_versions_single_source 钉住，改版本要三处同步）
+PLUGIN_VERSION = "1.5.0"
 
 # 账本放在插件外面，换插件、换版本都不会丢，也方便人直接翻
 DATA_DIR = Path(os.environ.get(
@@ -88,6 +91,10 @@ def _load_owners() -> frozenset:
 
 def _is_owner(event) -> bool:
     return event.unified_msg_origin in _load_owners()
+
+
+# 非 owner 时指令与工具统一的拒答文案
+OWNER_DENY_TEXT = "不可用：记忆账本只在用户和助手的私聊里开放。"
 
 # 画像块隔多久才注入一次。每轮都念同样的「用户的事」反而吵，默认一小时。
 PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600") or 3600)
@@ -217,7 +224,7 @@ def _fmt_hit(m: dict, idx: int = 0) -> str:
     return head + tail
 
 
-@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", "1.5.0")
+@register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", PLUGIN_VERSION)
 class MemoryCommitPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -231,11 +238,8 @@ class MemoryCommitPlugin(Star):
         self.INJECT_SLOTS = DEFAULT_INJECT_SLOTS
         # 注入观测账的当前行数（只用来决定要不要轮转，不参与任何行为）
         self._inject_lines = 0
-        # 维护任务节流计数：只有 % MAINTAIN_EVERY == 1 那几轮真去检查
+        # 维护任务节流计数：只有首轮和之后每 MAINTAIN_EVERY 轮各检查一次
         self._maintain_tick = 0
-        # 本轮用户消息在原文链上的序号（v5 增量原文锚）：memory_write 落库时
-        # 把新记忆锚回这句原话，后续 trace_to_source 能接回去。
-        self._last_user_seq = 0
         # 写路径异常计数：失败不再只留一行日志
         self.failures = FailureCounter()
         # 自动沉淀：距离上一次沉淀又聊了几轮、上次沉到原文链的哪个序号
@@ -356,6 +360,9 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆")
     async def cmd_memory(self, event: AstrMessageEvent):
         """记忆账本：/记忆 [关键词]"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").strip()
         arg = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
         if not arg:
@@ -373,6 +380,9 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆链")
     async def cmd_history(self, event: AstrMessageEvent):
         """看最近提交：/记忆链"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         rows = self.ledger.history(10)
         if not rows:
             yield event.plain_result("还没有任何提交。")
@@ -385,8 +395,13 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆冲刷")
     async def cmd_flush(self, event: AstrMessageEvent):
         """信息冲刷：/记忆冲刷 [确认]"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "")
-        confirm = "确认" in raw
+        # 破坏性操作要精确确认（R1）：只认独立的「确认」一词。
+        # 不许用「确认 in raw」——「不要确认」也含「确认」，会误执行。
+        confirm = "确认" in raw.split()
         if not confirm:
             plan = self.ledger.flush_plan()
             if not plan:
@@ -412,9 +427,13 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆容量")
     async def cmd_working(self, event: AstrMessageEvent):
         """工作记忆名额：/记忆容量 [确认] 或 /记忆容量 5"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").replace("记忆容量", "", 1)
-        confirm = "确认" in raw
-        found = re.search(r"(\d+)", raw.replace("确认", ""))
+        # 精确确认（R1）：「确认」必须是独立词，「不要确认」不算
+        confirm = "确认" in raw.split()
+        found = re.search(r"(\d+)", " ".join(t for t in raw.split() if t != "确认"))
         cap = int(found.group(1)) if found else None
         if cap is not None:  # 改了名额就记在这一趟里，重载后回到环境变量
             self.ledger.working_capacity = max(0, cap)
@@ -446,6 +465,9 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆压缩")
     async def cmd_compact(self, event: AstrMessageEvent):
         """把久远的提交并成一条基线：/记忆压缩 [保留条数]"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").replace("记忆压缩", "", 1)
         found = re.search(r"(\d+)", raw)
         keep = max(1, int(found.group(1))) if found else 10
@@ -467,33 +489,58 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆导出")
     async def cmd_export(self, event: AstrMessageEvent):
         """导出成能直接翻的 Markdown：/记忆导出"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         self.ledger.export_markdown(str(EXPORT_PATH))
         yield event.plain_result("导出好了：\n%s" % EXPORT_PATH)
 
     @filter.command("记忆备份")
     async def cmd_backup(self, event: AstrMessageEvent):
-        """导出可往返的 JSONL：/记忆备份 [路径]
+        """导出可往返的 JSONL：/记忆备份 [文件名]
 
         Markdown 那份是给人看的，丢了不心疼；这份丢了要重来的。
+        只能落进专用备份目录（R1）：参数只当文件名用，路径成分一律剥掉，
+        校验解析后的真实路径必须在备份目录内；同名已存在默认不覆盖。
         """
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").strip()
         parts = raw.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
-        path = arg or str(BACKUP_DIR / ("ledger-%s.jsonl"
-                                        % time.strftime("%Y%m%d-%H%M%S")))
+        # 客户端只传文件名：不管传来的是绝对路径还是带 .. 的相对路径，
+        # 都只留最后的文件名部分，再校验解析后路径确实落在专用目录里
+        name = os.path.basename(arg.replace("\\", "/")).strip() if arg else ""
+        if name in ("", ".", ".."):
+            name = "ledger-%s.jsonl" % time.strftime("%Y%m%d-%H%M%S")
+        if not name.lower().endswith(".jsonl"):
+            name += ".jsonl"
         try:
-            self.ledger.dump_jsonl(path)
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            target = BACKUP_DIR / name
+            base_real = Path(os.path.realpath(str(BACKUP_DIR)))
+            target_real = Path(os.path.realpath(str(target)))
+            if target_real != base_real and not target_real.is_relative_to(base_real):
+                raise LedgerError("备份只能写进专用目录：%s" % BACKUP_DIR)
+            if target_real.exists():
+                raise LedgerError("同名备份已存在，默认不覆盖，换个文件名再发")
+            self.ledger.dump_jsonl(str(target_real))
         except Exception as e:
             yield event.plain_result("没备份成：%s" % e)
             return
         st = self.ledger.stats()
         yield event.plain_result(
             "备份好了：\n%s\n\n提交 %d · 记忆 %d · 线索 %d · 结构版本 %d" % (
-                path, st["commits"], st["memories"], st["clues"], st["schema_version"]))
+                target_real, st["commits"], st["memories"], st["clues"],
+                st["schema_version"]))
 
     @filter.command("记忆自检")
     async def cmd_health(self, event: AstrMessageEvent):
         """重载后跑一遍：链、投影、写权限、导出、原文链 /记忆自检"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         res = self.ledger.health_check(str(EXPORT_PATH))
         st = res["stats"]
         lines = ["记忆账本自检：%s" % ("通过" if res["ok"] else "有问题")]
@@ -526,6 +573,10 @@ class MemoryCommitPlugin(Star):
         """
         if not _is_owner(event):
             return
+        # 原文锚绑在这次请求的事件上（R2），不再挂在插件实例：
+        # 不同会话/并发请求各锚各的，不会串；落链失败显式置 0，
+        # 不许沿用上一轮的锚去锚错原话。
+        anchor_seq = 0
         # 原文先落链，再谈检索：这条不管后面检索成不成立都得记下。
         # 检索词有长度上限，原文没有——「记得住」和「想得起」是两件事。
         try:
@@ -533,8 +584,8 @@ class MemoryCommitPlugin(Star):
             if said:
                 node = self.ledger.append_message(
                     "user", said, session_id=(event.unified_msg_origin or ""))
-                # v5 增量原文锚：记住这句原话的链上序号，本轮若写了记忆就锚回它
-                self._last_user_seq = int(node.get("seq") or 0)
+                # v5 增量原文锚：这句原话的链上序号，本轮若写了记忆就锚回它
+                anchor_seq = int(node.get("seq") or 0)
                 # 否认关键词命中 → 只进待确认队列，不自动改状态（v5 §5.1）。
                 # 「你记错了」这种话是线索不是判决，等人或原文对账确认。
                 hits = match_denial_keywords(said)
@@ -545,6 +596,11 @@ class MemoryCommitPlugin(Star):
                         self._note_failure("待确认队列写入失败", e)
         except Exception as e:
             self._note_failure("原文落链失败", e)
+            anchor_seq = 0
+        try:
+            event._mc_anchor_seq = anchor_seq
+        except Exception:
+            pass
         raw = (getattr(req, "prompt", "") or "").strip()
         # 空提示词就什么都不唤起。
         if not raw:
@@ -563,9 +619,10 @@ class MemoryCommitPlugin(Star):
         else:
             query = raw
         # 维护任务不是每轮都必须做：首轮和之后每 MAINTAIN_EVERY 轮各检查一次。
-        # 导出跨天才真写，换班有冷却，节流只是别让请求路径每轮白跑两趟。
+        # 写法必须是 (tick - 1) % N == 0（R8）：旧写法 tick % N == 1 在
+        # N=1 时余数恒为 0，条件永远不成立，维护一轮都不会跑。
         self._maintain_tick += 1
-        if self._maintain_tick % MAINTAIN_EVERY == 1:
+        if (self._maintain_tick - 1) % MAINTAIN_EVERY == 0:
             # 每天第一次请求前顺手刷一次 记忆账本.md，不额外挂定时器
             try:
                 self.ledger.maybe_export_daily(str(EXPORT_PATH))
@@ -583,8 +640,13 @@ class MemoryCommitPlugin(Star):
                 self._note_failure("WAL 截断失败", e)
         try:
             with_profile = (time.time() - self._profile_injected_at) >= PROFILE_REFRESH_SECONDS
+            # coexist 条件判定需要语境（R3）：至少会话场景与当前时间。
+            # 场景只给真实拿得到的会话标识，拿不到就整体传 None——判不出
+            # 条件的记忆按保守处理（不主动浮现），不许编造环境数据。
+            scene = (event.unified_msg_origin or "").strip()
+            context = {"scene": scene, "now": time.time()} if scene else None
             result = self.ledger.activate(query, slots=self.INJECT_SLOTS,
-                                          with_profile=with_profile)
+                                          with_profile=with_profile, context=context)
             stats: dict = {}
             brief = self.ledger.render_brief(result, max_chars=self.BRIEF_BUDGET,
                                              stats=stats)
@@ -624,6 +686,9 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆原话")
     async def cmd_raw(self, event: AstrMessageEvent):
         """翻原文链：/记忆原话 [关键词]"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").strip()
         parts = raw.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
@@ -649,6 +714,9 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆访问")
     async def cmd_access(self, event: AstrMessageEvent):
         """看看某条记忆被想起过几次、每次因为什么：/记忆访问 m1"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").strip()
         parts = raw.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
@@ -672,6 +740,9 @@ class MemoryCommitPlugin(Star):
     @filter.command("记忆唤起")
     async def cmd_activate(self, event: AstrMessageEvent):
         """看看此刻会自动想起什么：/记忆唤起 [关键词]"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
         raw = (event.get_message_str() or "").strip()
         parts = raw.split(None, 1)
         arg = parts[1].strip() if len(parts) > 1 else ""
@@ -715,7 +786,7 @@ class MemoryCommitPlugin(Star):
                 level=lvl if lvl in LEVELS else "day",
                 tags=tags if isinstance(tags, (str, list, tuple, set)) else "",
                 importance=_as_float(importance, 0.5),
-                anchor_seq=self._last_user_seq)
+                anchor_seq=getattr(event, "_mc_anchor_seq", 0))
         except LedgerError as e:
             return "没写进去：%s" % e
         return "已写入 %s（提交 %s），标签：%s" % (
@@ -778,7 +849,7 @@ class MemoryCommitPlugin(Star):
         try:
             res = self.ledger.deny_memory(_as_text(memory_id, "记忆编号"),
                                           _as_text(why, "否认理由", limit=200),
-                                          message_seq=self._last_user_seq)
+                                          message_seq=getattr(event, "_mc_anchor_seq", 0))
         except LedgerError as e:
             return "没标上：%s" % e
         return "已标记 %s 为有争议（不再主动提起，不删除）。提交 %s" % (

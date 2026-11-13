@@ -212,12 +212,13 @@ def test_export_writes_file(plugin):
     assert "导出好了" in out
 
 
-def test_backup_default_and_custom_path(plugin, tmp_path):
+def test_backup_default_and_custom_name(plugin, tmp_path):
+    """备份只能落专用目录（R1）：默认时间戳名，参数只当文件名用。"""
     plugin.ledger.remember("备份用的一条")
     assert "备份好了" in _cmd(plugin, "cmd_backup", "/记忆备份")
-    target = str(tmp_path / "b" / "x.jsonl")
-    out = _cmd(plugin, "cmd_backup", "/记忆备份 " + target)
-    assert os.path.exists(target)
+    assert os.path.isdir(str(tmp_path / "backup"))
+    out = _cmd(plugin, "cmd_backup", "/记忆备份 自定义名")
+    assert os.path.exists(str(tmp_path / "backup" / "自定义名.jsonl"))
     assert "结构版本" in out
 
 
