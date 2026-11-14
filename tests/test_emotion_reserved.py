@@ -19,6 +19,10 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 同 test_dream_duty：import 前摘掉环境开关，让「默认关」断言不受宿主环境影响。
+os.environ.pop("DREAM_SCHEDULER_ENABLED", None)
+os.environ.pop("EMOTION_ENABLED", None)
+
 try:
     import ledger as L  # noqa: E402
 except ModuleNotFoundError:

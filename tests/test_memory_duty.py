@@ -43,7 +43,10 @@ except ModuleNotFoundError:
 #   quiet_ids 原地扩展可选 context 参数，方法名不变不进清单）。
 # 2026-11-14 N1 降级新增 1 个，只读：
 #   auto_sink_ids（带 type:auto_sink 标记的自动沉淀条目集合，供 activate
-#   五条路线统一排除——索引不进系统提示；不新增任何写路径）。
+#   各条路线统一排除——索引不进系统提示；不新增任何写路径）。
+# 2026-11-14 N6 迁移新增 1 个，私有（不进本清单）：
+#   _migrate_auto_sink_legacy（打开旧库时补标记/摘机器边，走提交链；
+#   建边/改签靠 CommitBuilder.retype_memory / unlink_edge，非 Ledger 公开面）。
 # 2026-11-14 N2 修正不动公开面：机器/管理标签退出建图（type: 前缀 +
 # 「自动沉淀」统一标签，ledger.is_machine_tag 在唯一建图入口 _auto_link
 # 拦下），只改私有 _auto_link 与模块级函数，本清单无需变更。

@@ -38,7 +38,7 @@ except ImportError:  # 直接当脚本跑时
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
 # 版本号单一来源是 metadata.yaml；这里与之保持一致（一致性由
 # tests/test_r_fixes.py::test_versions_single_source 钉住，改版本要三处同步）
-PLUGIN_VERSION = "1.5.1"
+PLUGIN_VERSION = "1.5.2"
 
 # 账本放在插件外面，换插件、换版本都不会丢，也方便人直接翻
 DATA_DIR = Path(os.environ.get(
@@ -199,7 +199,8 @@ def _as_text(value: Any, name: str = "内容", limit: int = 0) -> str:
 def _as_int(value: Any, default: int, low: int = 0, high: int = 0) -> int:
     try:
         n = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：int(float("inf")) 这种（N4）。
         n = default
     if low:
         n = max(low, n)
@@ -231,6 +232,9 @@ def _fmt_hit(m: dict, idx: int = 0) -> str:
     tail = "   %s / %s / 分 %.2f" % (m["id"], GRADES.get(int(m["grade"]), "?"), m["score"])
     if m.get("clue_boost"):
         tail += " · 线索 +%.0f%%" % (float(m["clue_boost"]) * 100)
+    if m.get("disputed"):
+        # R3：显式检索也标出争议，别让被否认的记忆看起来和普通记忆一样可信
+        tail += " · 有争议（被否认过，待对证）"
     return head + tail
 
 
@@ -483,13 +487,26 @@ class MemoryCommitPlugin(Star):
 
     @filter.command("记忆压缩")
     async def cmd_compact(self, event: AstrMessageEvent):
-        """把久远的提交并成一条基线：/记忆压缩 [保留条数]"""
+        """把久远的提交并成一条基线：/记忆压缩 [保留条数] [确认]"""
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
         raw = (event.get_message_str() or "").replace("记忆压缩", "", 1)
-        found = re.search(r"(\d+)", raw)
+        # 破坏性操作要精确确认（R1，评审复测：/记忆压缩 1 一直无确认直接执行）：
+        # 只认独立的「确认」一词，与 /记忆冲刷、/记忆容量 同一口径。
+        confirm = "确认" in raw.split()
+        found = re.search(r"(\d+)", " ".join(t for t in raw.split() if t != "确认"))
         keep = max(1, int(found.group(1))) if found else 10
+        if not confirm:
+            commits = int(self.ledger.stats()["commits"])
+            if commits <= 1:
+                yield event.plain_result("只有 %d 个提交，没什么可压的。" % commits)
+                return
+            yield event.plain_result(
+                "压缩会把最早的提交并成一条基线，不可逆（现在 %d 个提交，保留最近 %d 个）。\n"
+                "发送「/记忆压缩%s确认」执行。" % (
+                    commits, keep, " %d " % keep if found else " "))
+            return
         try:
             res = self.ledger.compact(keep_recent=keep)
         except (LedgerError, StaleHeadError) as e:
@@ -596,6 +613,10 @@ class MemoryCommitPlugin(Star):
         # 不同会话/并发请求各锚各的，不会串；落链失败显式置 0，
         # 不许沿用上一轮的锚去锚错原话。
         anchor_seq = 0
+        # N4：said 也要先置空。get_message_str() 炸掉时它还没被赋值，
+        # 下面长 prompt 分支的 said 会 UnboundLocalError，把「落链失败」
+        # 升级成「唤起失败」，整轮注入直接消失。
+        said = ""
         # 原文先落链，再谈检索：这条不管后面检索成不成立都得记下。
         # 检索词有长度上限，原文没有——「记得住」和「想得起」是两件事。
         try:

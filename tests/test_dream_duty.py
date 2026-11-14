@@ -19,6 +19,13 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# DREAM_SCHEDULER_ENABLED / EMOTION_ENABLED 是 import ledger 那一刻读的环境开关。
+# 宿主进程开着它们跑测试，「默认关」断言会全红（三轮评审实测 3+1 条失败）。
+# 在 import 之前摘掉，这份文件测的永远是默认状态；要测开启行为，在用例里
+# patch.dict(os.environ) 后 importlib.reload，别依赖进程环境。
+os.environ.pop("DREAM_SCHEDULER_ENABLED", None)
+os.environ.pop("EMOTION_ENABLED", None)
+
 try:
     import ledger as L  # noqa: E402
 except ModuleNotFoundError:

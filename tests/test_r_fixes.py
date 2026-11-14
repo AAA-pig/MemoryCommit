@@ -4,7 +4,7 @@
 每个用例都先在旧实现上复现缺陷（写法保证旧行为必失败），再锁住修复后的行为：
   R1 指令鉴权 / 备份路径只能落专用目录且不覆盖 / 破坏性操作精确确认
   R2 原文锚绑到具体请求的事件，落链失败显式置空
-  R3 被否认 / coexist 的记忆不进主动注入（五条路线全覆盖）
+  R3 被否认 / coexist 的记忆不进主动注入（各条路线全覆盖）
   R4 删除事件带完整行身份，重放不出幽灵行，自检对账全部投影表
   R5 备份 v2：行数清单 + 尾部标记 + 严格导入 + 临时库预演
   R6 scope 贯穿线索桥 / 图谱一跳 / 梦产出
@@ -208,33 +208,34 @@ def _coexist(led, mid, cond=""):
 
 
 def test_denied_memory_blocked_on_all_activate_routes(led):
-    """disputed 五条路线全拦：direct / clue / graph / fresh / fallback。
+    """disputed 四条路线全拦（route=search / associate / activate / fallback）。
 
-    m3 与 m1 同 tags 且无状态，是对照组：它进得了 items，
-    证明路线本身在跑，m1 没出现是被 disputed 拦的，不是路没通。
+    recall 的 match 值 direct / clue / graph 是「命中来源」，不是 route，
+    别再拿它们当路线名。m3 与 m1 同 tags 且无状态，是对照组：它进得了
+    items，证明路线本身在跑，m1 没出现是被 disputed 拦的，不是路没通。
     """
     led.remember("用户的猫叫咪咪", tags="咪咪,宠物", importance=0.7)   # m1 disputed
     led.remember("给宠物买粮食", tags="宠物", importance=0.6)          # m2 检索锚点
     led.remember("宠物要定期驱虫", tags="宠物", importance=0.6)        # m3 对照组
     led.deny_memory("m1", "猫不是叫咪咪")
 
-    # direct / clue：query 撞词面与线索（「咪咪」在 m1 摘要与标签里）
+    # search（match=direct / clue:…）：query 撞词面与线索（「咪咪」在 m1 摘要与标签里）
     led._surfaced.clear()
     act = led.activate("咪咪", slots=4)
-    assert "m1" not in {r["id"] for r in act["items"]}, "被否认的记忆不许经 direct/clue 回来"
+    assert "m1" not in {r["id"] for r in act["items"]}, "被否认的记忆不许经 search 回来"
 
-    # graph：query 只命中 m2，m1 只能沿连边一跳进来
+    # associate（match=graph:…）：query 只命中 m2，m1 只能沿连边一跳进来
     led._surfaced.clear()
     act = led.activate("买粮食", slots=4)
     ids = {r["id"] for r in act["items"]}
-    assert "m2" in ids and "m3" in ids, "对照组证明 graph 一跳本身是通的"
-    assert "m1" not in ids, "被否认的记忆不许经 graph 一跳回来"
+    assert "m2" in ids and "m3" in ids, "对照组证明 associate 一跳本身是通的"
+    assert "m1" not in ids, "被否认的记忆不许经 associate 一跳回来"
 
-    # fresh：无 query 的正常激活路线
+    # activate：无 query 的正常激活路线
     led._surfaced.clear()
     act = led.activate("", slots=4)
     ids = {r["id"] for r in act["items"]}
-    assert "m3" in ids and "m1" not in ids, "fresh 路线拦 disputed，对照组能进"
+    assert "m3" in ids and "m1" not in ids, "activate 路线拦 disputed，对照组能进"
 
     # fallback：query 零命中时的兕底
     led._surfaced.clear()
@@ -266,9 +267,9 @@ def test_coexist_context_match_allows_activation(led):
 
 
 def test_coexist_context_mismatch_blocks_all_routes(led):
-    """coexist 条件不匹配：direct / clue / graph / fresh / fallback 五路全拦。
+    """coexist 条件不匹配：search / associate / activate / fallback 全拦。
 
-    m3 是对照组（同 tags 无状态）：graph/fresh 场景里它能进 items，
+    m3 是对照组（同 tags 无状态）：associate/activate 场景里它能进 items，
     证明路线通、拦截只落在条件不匹配的 m1 上。
     """
     led.remember("用户夏天怕热", tags="怕热,宠物", importance=0.7)   # m1 coexist
@@ -280,17 +281,17 @@ def test_coexist_context_mismatch_blocks_all_routes(led):
     led._surfaced.clear()
     act = led.activate("", slots=4, context=winter)
     ids = {r["id"] for r in act["items"]}
-    assert "m3" in ids and "m1" not in ids, "fresh：条件不匹配拦，对照组能进"
+    assert "m3" in ids and "m1" not in ids, "activate：条件不匹配拦，对照组能进"
 
     led._surfaced.clear()
     act = led.activate("怕热", slots=4, context=winter)
-    assert "m1" not in {r["id"] for r in act["items"]}, "direct/clue：条件不匹配拦"
+    assert "m1" not in {r["id"] for r in act["items"]}, "search：条件不匹配拦"
 
     led._surfaced.clear()
     act = led.activate("买粮食", slots=4, context=winter)
     ids = {r["id"] for r in act["items"]}
-    assert "m2" in ids and "m3" in ids, "对照组证明 graph 一跳本身是通的"
-    assert "m1" not in ids, "graph 一跳也不许把条件不匹配的记忆带进来"
+    assert "m2" in ids and "m3" in ids, "对照组证明 associate 一跳本身是通的"
+    assert "m1" not in ids, "associate 一跳也不许把条件不匹配的记忆带进来"
 
     led._surfaced.clear()
     act = led.activate("量子物理超导", slots=4, context=winter)
@@ -309,7 +310,7 @@ def test_coexist_bad_cond_json_blocked_even_with_context(led):
 
 
 def test_disputed_context_match_still_blocks_all_routes(led):
-    """disputed 不吃条件豁免：语境再匹配，五条路线照样全拦。"""
+    """disputed 不吃条件豁免：语境再匹配，各条路线照样全拦。"""
     led.remember("用户的猫叫咪咪", tags="咪咪,宠物", importance=0.7)   # m1 disputed
     led.remember("给宠物买粮食", tags="宠物", importance=0.6)          # m2 检索锚点
     led.deny_memory("m1", "猫不是叫咪咪")
@@ -321,7 +322,7 @@ def test_disputed_context_match_still_blocks_all_routes(led):
     assert "m1" not in {r["id"] for r in led.activate("咪咪", slots=4, context=summer)["items"]}
     led._surfaced.clear()
     ids = {r["id"] for r in led.activate("买粮食", slots=4, context=summer)["items"]}
-    assert "m2" in ids and "m1" not in ids, "graph 一跳也拦"
+    assert "m2" in ids and "m1" not in ids, "associate 一跳也拦"
     led._surfaced.clear()
     assert "m1" not in {r["id"] for r in led.activate("量子物理超导", slots=4,
                                                      context=summer)["items"]}
