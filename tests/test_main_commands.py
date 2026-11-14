@@ -510,6 +510,95 @@ def test_auto_sink_failure_counted(plugin, monkeypatch):
     assert plugin.failures.counts["自动沉淀失败"] == 1
 
 
+def test_auto_sink_default_off_six_turns(tmp_path, monkeypatch):
+    """N1：默认配置（不设环境变量）下跑 6 轮对话，memory 表行数不变。
+
+    默认轮次已从 6 降到 0：不打字也涨不了记忆，要开必须显式设
+    JJ_MEMORY_AUTO_SINK_EVERY。这里重新 import main，让默认值以
+    干净的环境变量为准（不受宿主机环境残留影响）。
+    """
+    monkeypatch.delenv("JJ_MEMORY_AUTO_SINK_EVERY", raising=False)
+    monkeypatch.setenv("JJ_MEMORY_DIR", str(tmp_path))
+    monkeypatch.setenv("JJ_MEMORY_OWNERS", UMO)
+    monkeypatch.setenv("JJ_MEMORY_MAINTAIN_EVERY", "20")
+    sys.path.insert(0, PLUGIN_DIR)
+    sys.modules.pop("main", None)
+    try:
+        import main as m
+        assert m.AUTO_SINK_EVERY == 0
+        plugin = m.MemoryCommitPlugin(None)
+        before = plugin.ledger.stats()["memories"]
+        for i in range(6):
+            asyncio.run(plugin.inject_memory(_Event("第 %d 轮：空调开 26 度" % i),
+                                             _Req("第 %d 轮" % i)))
+            asyncio.run(plugin.record_reply(_Event(), _Resp("好，记住了 %d" % i)))
+        assert plugin.ledger.stats()["memories"] == before
+    finally:
+        sys.modules.pop("main", None)
+
+
+def test_auto_sink_tagged_and_excluded_from_injection(mod, plugin, monkeypatch):
+    """N1：显式开启自动沉淀后，沉淀条目也不许当普通事实注入系统提示。
+
+    走真实 inject_memory（on_llm_request 入口）断言 system_prompt，
+    不是靠标签字符串猜：沉淀条目与普通条目都含「空调」词面、同走
+    search 路线，修复后只有普通条目进提示词（对照组），证明排除靠
+    类型标记语义，不是整条检索路线坏了。
+    """
+    import main as m
+    monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
+    plugin.ledger.remember("空调遥控器放在电视柜第二个抽屉")
+    # 第一次请求只落链不唤起（空 prompt）：activate 会把对照组激活并进
+    # 25 分钟冷却，第二次断言就验证不了「search 路线上普通条目照常注入」。
+    asyncio.run(plugin.inject_memory(_Event("第 1 轮：空调开 26 度"), _Req("")))
+    asyncio.run(plugin.record_reply(_Event(), _Resp("好，记住了")))
+    row = plugin.ledger._query_one(
+        "SELECT id, tags, summary FROM memory WHERE tags LIKE ?",
+        ("%type:auto_sink%",))
+    assert row, "沉淀条目没写进去，测试环境坏了"
+    assert "自动沉淀" in row["tags"]
+    assert "type:auto_sink" in row["tags"]
+    req = _Req("空调")
+    asyncio.run(plugin.inject_memory(_Event("空调"), req))
+    prompt = req.system_prompt or ""
+    assert "自动沉淀" not in prompt
+    assert "电视柜" in prompt
+
+
+def test_auto_sink_excluded_from_fallback_route(mod, plugin, monkeypatch):
+    """N1：检索落空走 fallback 兜底时，沉淀条目也不能顶进提示词。
+
+    沉淀条目 importance 0.45 高于对照组 0.1，fresh 排序排第一；
+    修复前 fallback 会把它的「自动沉淀：…」正文塞进 system_prompt，
+    修复后只能放对照组——两条断言缺一不可，防止「兜底整个坏了」
+    被误判成「排除生效」。
+    """
+    import main as m
+    monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
+    plugin.ledger.remember("用户喜欢喝热咖啡", importance=0.1)
+    # 同上：第一次请求只落链，不让对照组提前进冷却，
+    # 否则 fallback 只剩冷却挡光的候选，断言不出排除语义。
+    asyncio.run(plugin.inject_memory(_Event("第 1 轮：空调开 26 度"), _Req("")))
+    asyncio.run(plugin.record_reply(_Event(), _Resp("好，记住了")))
+    assert plugin.ledger._query_one(
+        "SELECT id FROM memory WHERE tags LIKE ?", ("%type:auto_sink%",))
+    req = _Req("量子纠缠")
+    asyncio.run(plugin.inject_memory(_Event("量子纠缠"), req))
+    prompt = req.system_prompt or ""
+    assert "自动沉淀" not in prompt
+    assert "热咖啡" in prompt
+
+
+def test_auto_sink_still_searchable(mod, plugin, monkeypatch):
+    """N1：排除只发生在注入侧，显式检索（recall）照样找得到沉淀条目。"""
+    import main as m
+    monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
+    asyncio.run(plugin.inject_memory(_Event("第 1 轮：空调开 26 度"), _Req("第 1 轮")))
+    asyncio.run(plugin.record_reply(_Event(), _Resp("好，记住了")))
+    hits = plugin.ledger.recall("空调", touch=False)
+    assert any("type:auto_sink" in (h.get("tags") or "") for h in hits)
+
+
 # -- 退出 ------------------------------------------------------------------
 
 def test_terminate_exports_then_closes(plugin):
