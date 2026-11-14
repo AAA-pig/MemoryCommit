@@ -41,8 +41,12 @@ except ModuleNotFoundError:
 # 2026-11-13 R3 语义修正新增 1 个，只读：
 #   disputed_ids（disputed 档的具名集合，denied_ids 同一事实的 R3 命名；
 #   quiet_ids 原地扩展可选 context 参数，方法名不变不进清单）。
+# 2026-11-14 N1 降级新增 1 个，只读：
+#   auto_sink_ids（带 type:auto_sink 标记的自动沉淀条目集合，供 activate
+#   五条路线统一排除——索引不进系统提示；不新增任何写路径）。
 LEDGER_PUBLIC_METHODS = frozenset({
     "access_history", "activate", "anchor_memory", "append_message",
+    "auto_sink_ids",
     "classify_pair", "close", "commit", "compact", "current_status",
     "denial_history", "denied_ids", "deny_memory", "deny_revoke", "disputed_ids",
     "dream_add_memory",

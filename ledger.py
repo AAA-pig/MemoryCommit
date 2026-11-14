@@ -98,6 +98,12 @@ LEVELS = ("topic", "day", "week", "month", "quarter", "year")
 GRADES = {0: "零级", 1: "一级", 2: "二级"}
 MAX_GRADE = 2
 
+# 自动沉淀条目的机器可读类型标记（N1 降级）。这类条目是「聊过什么」的原文
+# 索引：正文只是前 60 字摘录 + 词面碎片关键词，当普通事实注入会把索引抬成
+# 结论。统一标签「自动沉淀」保留给人看和显式检索；唤起（activate）五条路线
+# 按 auto_sink_ids() 识别这个标记并一律排除，普通记忆注入路径不再收它们。
+AUTO_SINK_TYPE_TAG = "type:auto_sink"
+
 FLUSH_K = 6.0          # 冲刷压力分母系数
 HALF_LIFE_DAYS = 30.0  # 检索的时间半衰期（animaone 用的是 30 天）
 
@@ -2124,7 +2130,10 @@ class Ledger:
         # （direct / clue / graph / fresh / fallback）永久拦；coexist（条件并存）
         # 只在语境能判定且条件匹配时放行，判不出/不匹配同样拦。
         # 显式检索 recall 不受此限，仍能找到但 disputed 降权。
+        # N1 降级同走这里：自动沉淀条目是原文索引，不管用户把轮次开到几，
+        # 都不许当普通事实进系统提示，五条路线一起拦。
         quiet = self.quiet_ids(context)
+        auto_sink = self.auto_sink_ids()
 
         def take(rows: Iterable[Dict[str, Any]], route: str,
                  cap: Optional[int] = None, force: bool = False) -> bool:
@@ -2134,7 +2143,7 @@ class Ledger:
                 if len(picked) >= cap:
                     break
                 mid = row["id"]
-                if mid in seen or mid in quiet or (not force
+                if mid in seen or mid in quiet or mid in auto_sink or (not force
                                    and now - self._surfaced.get(mid, 0.0) < cooldown):
                     continue
                 r = dict(row)
@@ -2908,6 +2917,24 @@ class Ledger:
         """disputed（被用户否认）的记忆集合：R3 语义里它是唯一
         「永远不主动提」的档，不吃条件豁免。"""
         return {m for m, s in self._latest_status_map().items() if s == "disputed"}
+
+    def auto_sink_ids(self) -> set:
+        """带自动沉淀类型标记（AUTO_SINK_TYPE_TAG）的记忆集合（N1）。
+
+        这些条目是原文索引不是普通事实：唤起（activate）的五条路线
+        （search / associate / graph / activate / fallback）一律不收，
+        只留给显式检索（recall / search_messages）找。
+        SQL 先按子串缩小范围，Python 再按逗号分隔的完整标签精确判定，
+        不靠 LIKE 子串猜，免得「type:auto_sink_x」这类前缀撞车。
+        """
+        out: set = set()
+        for r in self._query_all(
+                "SELECT id, tags FROM memory WHERE tags LIKE ?",
+                ("%" + AUTO_SINK_TYPE_TAG + "%",)):
+            tags = {t.strip() for t in (r["tags"] or "").split(",")}
+            if AUTO_SINK_TYPE_TAG in tags:
+                out.add(r["id"])
+        return out
 
     def denied_ids(self) -> set:
         """被用户否认（最新档 disputed）的记忆集合。disputed_ids 的旧名。"""
