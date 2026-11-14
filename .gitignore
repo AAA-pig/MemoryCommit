@@ -6,7 +6,12 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+*.jsonl
 data/
+backup/
 记忆账本.md
 
 # 本地杂项

@@ -1,0 +1,45 @@
+#!/bin/sh
+# 拦截私人数据进版本库。
+#
+# 远端只放代码。账本、备份、观测日志、导出文件都属于本机私人数据，
+# 一旦提交就等于永久留在 git 历史里，删掉当前文件也清不干净。
+# .gitignore 是第一道，这里是第二道：即使 ignore 被改坏、
+# 或者有人用 git add -f 硬塞，也在这里拦下来。
+#
+# 确实要放行（几乎不该用到）：git commit --no-verify
+
+blocked=""
+
+staged=$(git -c core.quotepath=false diff --cached --name-only --diff-filter=ACMR)
+
+IFS='
+'
+for f in $staged; do
+    case "$f" in
+        *.db|*.db-wal|*.db-shm|*.db-journal|*.sqlite|*.sqlite3)
+            blocked="${blocked}  $f  —— 数据库文件
+" ;;
+        *.jsonl|*.log)
+            blocked="${blocked}  $f  —— 日志/观测记录
+" ;;
+        data/*|backup/*|*/data/*|*/backup/*)
+            blocked="${blocked}  $f  —— 数据目录
+" ;;
+        记忆账本*|*/记忆账本*)
+            blocked="${blocked}  $f  —— 账本导出
+" ;;
+    esac
+done
+
+if [ -n "$blocked" ]; then
+    printf '\n'
+    printf '提交被拒：这些是私人数据，不能进版本库\n'
+    printf '%s' "$blocked"
+    printf '\n先把它们移出版本库：\n'
+    printf '  git restore --staged <文件>   # 只取消暂存，磁盘上的文件不动\n'
+    printf '  git rm --cached <文件>        # 以前提交过的，从索引里摘掉\n'
+    printf '\n'
+    exit 1
+fi
+
+exit 0
