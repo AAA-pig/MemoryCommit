@@ -1,6 +1,6 @@
 [project]
 name = "astrbot-plugin-memory-commit"
-version = "1.5.2"
+version = "1.6.0"
 description = "带提交链和分层检索的外置记忆账本"
 readme = "README.md"
 requires-python = ">=3.10"

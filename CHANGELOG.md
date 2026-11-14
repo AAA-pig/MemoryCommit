@@ -1,5 +1,55 @@
 # CHANGELOG
 
+## 1.6.0 — 2026-11-14
+
+按外部审查报告（《MemoryCommit 项目代码审查与改进方案》2026-11-14）做的可靠性加固轮：备份完整性、有损导入、安全表述、持久性档位、时间契约。
+
+### 破坏性变更（升级前先读这两条）
+
+- **备份格式 v3（DUMP_VERSION 2→3）**：access_log 纳入 JSONL 备份。旧版本代码（只认 v2）读到 v3 备份会在文件头拒收（「备份格式 v3 比当前支持的 v2 新」）——先升级代码再导入；反过来 v2 及更早的老备份在新代码里照常导入，只是里面本来就没有访问明细
+- **有损导入默认拒绝**：备份里带当前库不存在的列时，load_jsonl 默认抛错（报错列出 表.列，原库一字节不动）；确认接受降级导入须显式传 allow_lossy=True，行为同旧版（照灌并在结果里报告丢列）
+
+### P0-1 备份补 access_log
+
+- DUMP_TABLES 末尾加 access_log、_DUMP_ORDER 补稳定排序 id、DUMP_VERSION 2→3。access_log 虽是「体温计」不是账本事实，但近期命中、工作记忆复出、访问审计都按时间窗口吃它的明细——少了它，dump/load 之后「整本原样搬家」实际只搬了半截
+- 往返测试：多条访问记录（公开 API 触发 + 直插跨时间窗口旧记录）dump→新库 load 后行数/内容/id 逐行一致、stats().accesses 一致、health_check 通过；v2 老备份手工摘掉 access_log 段与行数清单后仍可导入（访问明细 0，不假装恢复出来）
+- 变异自检：从 DUMP_TABLES 删掉 access_log，两条当场红；恢复后绿
+
+### P0-3 有损导入预检
+
+- load_jsonl 加 allow_lossy=False：落库前预检（只读目标库表结构，走在 _tx 与恢复预演之前——预演库也好、正式库也好，都不许先写半截再回头拒绝），发现丢列抛 LedgerError 列出 表.列 并提示可传 allow_lossy=True；allow_lossy=True 保持旧行为
+- 两条旧测试按新行为改造（原断言有意期望静默成功）：test_load_drops_unknown_columns（v2 严格路径）与 test_load_jsonl_skips_bad_rows_and_reports（v1 宽容路径）都改为默认拒绝 + allow_lossy=True 对照旧行为——宽容只宽容坏行，不宽容静默丢列
+- 变异自检：把预检短路掉，两条当场红；恢复后绿
+
+### P0-2 哈希链表述纠偏
+
+- 全仓库「不可篡改」只在 message 表注释与 append_message docstring 两处（README 没这说法），改为准确表述：哈希链提供篡改检测与内部一致性校验（单条改动、中间删除、尾部截断查得出），不防重算整条链，也不等于来源可信；更强保证要靠库外独立锚定。本轮只改表述，不实现外部锚定
+
+### P1-4 持久性档位显式化
+
+- Ledger.__init__ 加 durability 参数：默认 NORMAL（行为不变），只接受 NORMAL/FULL（大小写规范化），非法值抛 LedgerError 拒开。NORMAL 偏性能（断电可能丢最近几秒写入），FULL 每次同步落盘（断电几乎不丢，每次写入付 fsync）
+- main.py 新配置 JJ_MEMORY_DURABILITY（默认 NORMAL），非法值同样显式失败；把账本当唯一记忆源的建议设 FULL
+- 测试：默认 NORMAL（PRAGMA synchronous=1）、full 规范化 FULL（=2）、非法值显式失败
+
+### P1-5 时间契约写明（不动数据）
+
+- now_str / _parse_time_cached / _parse_time 补契约 docstring：账本时间是本地时间、无时区偏移，解析按运行机器本地时区（mktime 语义）；跨时区搬库后时间差、每日导出日期、访问窗口可能偏移
+- 统一 UTC 要牵动存量数据的解释（迁移级改动），本轮只写契约不迁移；新增测试固定这个已知限制，哪天改 UTC 这条测试就是第一个要改写的见证
+
+### 测试
+
+- 默认环境：470 passed（基线 464：新增 6——access_log 往返、v2 无 access_log 兼容、durability 三条、时间契约一条；改造 2——两条有损导入旧测试）
+- 开关环境（DREAM_SCHEDULER_ENABLED=true + EMOTION_ENABLED=true + JJ_MEMORY_AUTO_SINK_EVERY=6）：470 passed
+- 全部用临时库，未碰生产账本
+
+### 未做（写清楚，别当成已实现）
+
+- **P1-1 核心文件拆分**：ledger.py 仍是单文件多职责（检索/生命周期/备份/自检都在里面）。原因：拆分前要先补公开接口契约测试与 golden dataset 对账，牵动全部测试基线，值得单独一轮做，塞进加固轮只会拆一半留烂尾
+- **P1-2 检索评测集**：没有建立评测查询集与指标脚本（Recall@5 / MRR 等）。原因：需要标注数据与固定数据集版本，属于建立质量基准的新工作，不是本轮「修对错」的范围内
+- **P1-6 provenance 来源体系**：记忆没有统一来源字段与权限矩阵（user_explicit / auto_summary 等）。原因：动表结构要 schema 版本迁移，还要理清与现有 tags / type: 机器标记的关系，需要单独设计
+- **P0-2 外部锚定**：只把安全表述说准，没有实现链头导出 / HMAC / 签名。原因：涉及密钥管理与外部存储选型，是独立的工程决策
+- **P1-5 时间统一 UTC**：只写契约不动数据。原因：存量时间都是本地时间，迁移必须带上「旧机器时区」的假设，牵动所有按日期计算的逻辑，需要带数据迁移的专门一轮
+
 ## 1.5.2 — 2026-11-14
 
 第三轮锐评（fb9dfa4）的修复：让「沉淀不进提示词」对存量数据也成立，并把沉淀在存储层降回索引。
