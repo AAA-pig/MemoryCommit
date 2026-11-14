@@ -9,9 +9,10 @@
     若全绿 -> 醒目报「报警器失效」：代码退回旧版而测试毫无反应，
     下次真出事的时候测试也会一声不吭。
 
-  B 全量覆盖（代码回旧版 + tests 回到回滚点，即丢掉回滚点之后新增的用例）
+  B 全量覆盖（代码回旧版 + tests 整套 `git checkout <回滚点> -- tests` 还原）
     期望：绿。绿表示「退回去这个版本自身是健康的」。
-    同时算清丢了几个用例（lost_cases），这是回滚的隐形成本。
+    同时算清丢了几个用例（lost_cases）：回滚点相对当前 test 集合的净丢失，
+    按收集到的 node id 集合差来数（不是总数相减），这是回滚的隐形成本。
 
 用法：
   .\tools\rollback_drill.ps1                 # 实跑两遍
@@ -129,20 +130,96 @@ function Restore-CodeFiles($work) {
 }
 
 function Restore-TestsToTarget($work) {
-    # 回滚点的 tests/ 名单：git ls-tree 只读，不动工作区
-    $tracked = & git -C $RepoRoot ls-tree -r --name-only $RollbackTarget -- tests 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "git ls-tree $RollbackTarget 失败" }
-    $keep = @{}
-    foreach ($p in $tracked) { if ($p) { $keep[$p] = $true } }
-    $removed = 0
+    <#
+    把隔离副本的 tests 整棵树还原到回滚点（不只是删文件）。
+
+    为什么不沿用旧写法：旧实现只按 `git ls-tree <回滚点> -- tests` 的名单
+    删除「回滚点之后新增」的测试文件，同名文件保持新版内容不动。于是
+    tests/test_ledger.py、tests/test_memory_duty.py 这类在 1149e3b 被改过的
+    文件，会带着新断言去跑旧代码，必然红 —— 那是脚本口径造成的假红，
+    不是回滚点不健康。现在改成：
+      1) 删掉副本里的 tests/ 整棵树（隔离副本，删了只影响副本）
+      2) `git checkout <回滚点> -- tests` 一次性取出回滚点的 tests 树
+    这样同名文件的内容、回滚点之后新增的文件、回滚点之后删掉的文件，
+    三件事一次对齐到回滚点。
+
+    另外统计文件级差异（删了几个、补回几个），只用于报告，不参与判定。
+    #>
+    $testDir = Join-Path $work "tests"
+    # 只统计源码文件：__pycache__ 里的 .pyc 是上一次收集的产物，不算「测试文件」
+    $rel = {
+        param($file, $root)
+        $p = ($file.FullName.Substring($root.Length) -replace '\\', '/').TrimStart('/')
+        if ($p -match '__pycache__/') { return $null }
+        return $p
+    }
+    $before = @()
+    if (Test-Path $testDir) {
+        $before = @(Get-ChildItem -Recurse -File $testDir | ForEach-Object { & $rel $_ $work } | Where-Object { $_ })
+        Remove-Item -Recurse -Force $testDir
+    }
+    & git -C $work checkout $RollbackTarget -- tests 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "git checkout $RollbackTarget -- tests 失败（回滚点里没有 tests/？）" }
+    $after = @()
+    if (Test-Path $testDir) {
+        $after = @(Get-ChildItem -Recurse -File $testDir | ForEach-Object { & $rel $_ $work } | Where-Object { $_ })
+    }
+    return [ordered]@{
+        files_before = $before.Count
+        files_after  = $after.Count
+        removed      = @($before | Where-Object { $after -notcontains $_ })
+        restored     = @($after | Where-Object { $before -notcontains $_ })
+    }
+}
+
+function Get-TestsMismatch($work, $rev) {
+    <#
+    逐文件比对副本的 tests/ 与某个提交的 tests 树（只看磁盘，不看 index）。
+    返回不一致项：多余 / 内容不同 / 缺失。空数组 = 与回滚点逐字节一致。
+    只用于场景 B 红了之后的归因，不参与正常判定。
+    #>
+    $mismatch = @()
+    $target = @{}
+    foreach ($p in (& git -C $work ls-tree -r --name-only $rev -- tests 2>$null)) {
+        if ($p) { $target[$p] = (& git -C $work rev-parse ("{0}:{1}" -f $rev, $p)).Trim() }
+    }
+    $onDisk = @{}
     $testDir = Join-Path $work "tests"
     if (Test-Path $testDir) {
-        foreach ($item in Get-ChildItem -Recurse -File $testDir) {
-            $rel = ($item.FullName.Substring($work.Length) -replace '\\', '/').TrimStart('/')
-            if (-not $keep.ContainsKey($rel)) { Remove-Item -Force $item.FullName; $removed++ }
+        foreach ($f in Get-ChildItem -Recurse -File $testDir) {
+            $rel = ($f.FullName.Substring($work.Length) -replace '\\', '/').TrimStart('/')
+            if ($rel -match '__pycache__/') { continue }
+            $onDisk[$rel] = $true
         }
     }
-    return $removed
+    foreach ($rel in $onDisk.Keys) {
+        if (-not $target.ContainsKey($rel)) { $mismatch += "$rel(多余)"; continue }
+        $h = (& git -C $work hash-object --path=$rel $rel).Trim()
+        if ($h -ne $target[$rel]) { $mismatch += "$rel(内容不同)" }
+    }
+    foreach ($rel in $target.Keys) { if (-not $onDisk.ContainsKey($rel)) { $mismatch += "$rel(缺失)" } }
+    return $mismatch
+}
+
+function Get-CollectedIds($work) {
+    <#
+    收集当前 tests 树里的用例 node id 集合（形如 tests/test_x.py::test_y[param]）。
+
+    用途：算 lost_cases。口径见场景 B 的注释 —— 用集合差，不用总数相减。
+    收集失败（返回空集合）由调用方判 -1，不静默当 0。
+    #>
+    Push-Location $work
+    try {
+        $out = & $Python -m pytest -q --collect-only -p no:cacheprovider 2>&1 | Out-String
+    } finally {
+        Pop-Location
+    }
+    $ids = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($line in ($out -split "`r?`n")) {
+        $t = $line.Trim()
+        if ($t -match '::') { [void]$ids.Add($t) }
+    }
+    return $ids
 }
 
 # --------------------------------------------------------------------------
@@ -176,7 +253,7 @@ if ($DryRun) {
         code_files      = $CodeFiles
         scenarios       = @(
             [ordered]@{ name = "A_code_only"; expect = "red"; steps = @("隔离副本", "覆盖 $($CodeFiles -join ', ')", "tests 保持 HEAD", "pytest -q") },
-            [ordered]@{ name = "B_full"; expect = "green"; steps = @("隔离副本", "覆盖代码", "tests 退回 $RollbackTarget 名单", "pytest -q", "算 lost_cases") }
+            [ordered]@{ name = "B_full"; expect = "green"; steps = @("隔离副本", "覆盖代码", "tests 整套 git checkout $RollbackTarget -- tests", "pytest -q", "算 lost_cases（node id 集合差）") }
         )
     }
     $plan | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 (Join-Path $OutDir "drill_result.json")
@@ -228,25 +305,55 @@ $workB = Join-Path $env:TEMP ("drill_B_" + [guid]::NewGuid().ToString("N"))
 Write-Step "场景 B 开始（隔离副本 $workB）"
 New-IsolatedCopy $workB | Out-Null
 $headCollectedB = (Invoke-Pytest $workB "B_baseline_head").collected
+# lost_cases 口径（别让数字凭空变）：
+#   lost_cases = 回滚点相对当前 test 集合的「净丢失用例数」
+#              = |当前收集到的 node id 集合 − 回滚点收集到的 node id 集合|
+#   用 node id 集合差，不用「收集总数相减」：总数相减会把同名文件里
+#   「删掉的用例」和「新加的用例」相互抵消，也说不清丢的是哪个；
+#   集合差逐条对得上，且只算当前有、回滚点没有的（净丢失）。
+$headIds = Get-CollectedIds $workB
 Restore-CodeFiles $workB
-$removed = Restore-TestsToTarget $workB
+$testRestore = Restore-TestsToTarget $workB
+$removed = $testRestore.removed.Count
 $resB = Invoke-Pytest $workB "B_full"
 $targetCollected = $resB.collected
-$lost = if ($headCollectedB -ge 0 -and $targetCollected -ge 0) { $headCollectedB - $targetCollected } else { -1 }
+$targetIds = Get-CollectedIds $workB
+if ($headIds.Count -gt 0 -and $targetIds.Count -gt 0) {
+    $lostIds = @($headIds | Where-Object { -not $targetIds.Contains($_) })
+    $lost = $lostIds.Count
+} else {
+    $lostIds = @()
+    $lost = -1
+}
 $bGreen = ($resB.exit_code -eq 0)
 $resB["expect"] = "green"
 $resB["head_collected"] = $headCollectedB
 $resB["removed_test_files"] = $removed
+$resB["removed_test_file_list"] = @($testRestore.removed)
+$resB["restored_test_file_list"] = @($testRestore.restored)
+$resB["tests_files_before"] = $testRestore.files_before
+$resB["tests_files_after"] = $testRestore.files_after
 $resB["lost_cases"] = $lost
+$resB["lost_cases_sample"] = @($lostIds | Select-Object -First 10)
 if ($bGreen) {
     $resB["actual"] = "green"
-    Write-Step ("场景 B：绿（passed={0}），丢失用例 {1} 条（{2} -> {3}）" -f $resB.passed, $lost, $headCollectedB, $targetCollected)
+    Write-Step ("场景 B：绿（passed={0}），净丢失用例 {1} 条（收集数 {2} -> {3}）" -f $resB.passed, $lost, $headCollectedB, $targetCollected)
 } elseif ($resB.failed -eq 0 -and $resB.errors -gt 0) {
     $resB["actual"] = "error_red"
     Write-Host ("[drill][弱信号] 场景 B 只有 {0} 个 error、0 failed：回滚点代码收集期就挂，别退" -f $resB.errors) -ForegroundColor Yellow
 } else {
     $resB["actual"] = "red"
-    Write-Host ("[drill][异常] 场景 B 回滚后仍红（failed={0}）：回滚点自身不健康，先别退" -f $resB.failed) -ForegroundColor Yellow
+    # 红了必须分清是「回滚点真不健康」还是「脚本没把 tests 还原干净」：
+    # 拿副本 tests 树与回滚点逐文件比 hash（多余/内容不同/缺失三种）
+    $mismatch = @(Get-TestsMismatch $workB $RollbackTarget)
+    $resB["tests_mismatch_vs_target"] = $mismatch
+    if ($mismatch.Count -eq 0) {
+        $resB["red_cause"] = "real_regression"
+        Write-Host ("[drill][异常] 场景 B 回滚后仍红（failed={0}）：tests 已与回滚点逐文件一致，属真回归——回滚点自身不健康，先别退" -f $resB.failed) -ForegroundColor Yellow
+    } else {
+        $resB["red_cause"] = "script_incomplete"
+        Write-Host ("[drill][异常] 场景 B 仍红（failed={0}），但 tests 有 {1} 个文件与回滚点不一致，属脚本没还原干净，不当作回滚点结论：{2}" -f $resB.failed, $mismatch.Count, ($mismatch -join ", ")) -ForegroundColor Yellow
+    }
 }
 if (-not $KeepWork) { Remove-Item -Recurse -Force $workB -ErrorAction SilentlyContinue }
 
@@ -261,9 +368,10 @@ switch ($resA.alarm) {
     "no_drift"  { $verdict += "A 绿，但代码与回滚点零差异，本轮无法验证报警器" }
     "BLIND"     { $verdict += "A 绿且代码确有差异，报警器失效" }
 }
-if ($bGreen) { $verdict += ("B 绿，回滚点健康，丢弃 {0} 条用例" -f $lost) }
+if ($bGreen) { $verdict += ("B 绿，回滚点健康，净丢失 {0} 条用例" -f $lost) }
 elseif ($resB.actual -eq "error_red") { $verdict += "B 收集期就报错，回滚点不可用" }
-else { $verdict += "B 红，回滚点不健康" }
+elseif ($resB.red_cause -eq "script_incomplete") { $verdict += "B 红，但 tests 未还原干净（脚本问题），不作为回滚点结论" }
+else { $verdict += "B 红，tests 与回滚点一致，回滚点不健康" }
 
 $result = [ordered]@{
     dry_run             = $false
@@ -298,7 +406,7 @@ $md = @(
     "## 场景 B（全量覆盖）",
     "- 期望：绿；实际：" + $resB.actual,
     "- 退出码 " + $resB.exit_code + "，passed " + $resB.passed + "，failed " + $resB.failed + "，errors " + $resB.errors + "，耗时 " + $resB.seconds + "s",
-    "- 用例数：" + $headCollectedB + " -> " + $targetCollected + "，丢失 " + $lost + " 条；删除测试文件 " + $removed + " 个",
+    "- 用例数：" + $headCollectedB + " -> " + $targetCollected + "，净丢失 " + $lost + " 条（node id 集合差）；tests 文件 " + $testRestore.files_before + " -> " + $testRestore.files_after + "，删除 " + $removed + " 个、补回 " + $testRestore.restored.Count + " 个",
     "",
     "## 结论",
     ($verdict -join "；")
