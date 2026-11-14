@@ -104,6 +104,25 @@ MAX_GRADE = 2
 # 按 auto_sink_ids() 识别这个标记并一律排除，普通记忆注入路径不再收它们。
 AUTO_SINK_TYPE_TAG = "type:auto_sink"
 
+# 自动沉淀条目的统一标签（N2）。main.AUTO_SINK_TAG 与这里必须同一字面。
+# 两个标记进 tags 都只为「识别 + 显式检索」（auto_sink_ids() 精确匹配
+# type:auto_sink；recall 搜「自动沉淀」靠 tags 命中），不是为了当概念。
+AUTO_SINK_LABEL = "自动沉淀"
+
+
+def is_machine_tag(tag: str) -> bool:
+    """机器/管理标签判定（N2）：type: 前缀的类型标记，或自动沉淀的统一标签。
+
+    tags 即概念、写入即建图（_auto_link），所以「识别用的标记」一旦写进
+    tags，就会被当成语义概念和历史条目织网——实测 5 条沉淀探针自己连出
+    20 条 concept 边（「自动沉淀」与 type:auto_sink 各 10 条），把「聊过
+    什么」的原文索引抬成了图谱上的语义同源。这类标签在唯一建图入口
+    _auto_link 里统一拦下：它们不配当 concept，也不把别的条目和沉淀
+    索引互相连线；检索、识别、注入排除一概不受影响。
+    """
+    t = (tag or "").strip()
+    return t.startswith("type:") or t == AUTO_SINK_LABEL
+
 FLUSH_K = 6.0          # 冲刷压力分母系数
 HALF_LIFE_DAYS = 30.0  # 检索的时间半衰期（animaone 用的是 30 天）
 
@@ -1311,8 +1330,17 @@ class CommitBuilder:
         return mid
 
     def _auto_link(self, mid: str, tag_list: List[str]) -> None:
-        """标签就是概念：和历史上共用同一概念的节点自动织网。"""
+        """标签就是概念：和历史上共用同一概念的节点自动织网。
+
+        N2：机器/管理标签（type: 前缀类型标记、「自动沉淀」统一标签）不是
+        语义概念，在这里拦下不许当 concept——见 is_machine_tag。识别和
+        检索仍走 tags（auto_sink_ids / recall），只有建图这一条路收紧。
+        存量库里已织出的这类边不自动回收：默认关后新库不会再产生，注入
+        侧另有 auto_sink 排除兜着，不影响提示词。
+        """
         for tag in tag_list:
+            if is_machine_tag(tag):
+                continue
             hits = self.ledger._query_all(
                 "SELECT id FROM memory WHERE id != ? AND tags LIKE ? LIMIT 8",
                 (mid, "%" + tag + "%"))

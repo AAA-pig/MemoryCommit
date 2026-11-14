@@ -26,12 +26,12 @@ from astrbot.api.star import Context, Star, register
 
 try:
     from .ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
-                         AUTO_SINK_TYPE_TAG,
+                         AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
                          Ledger, LedgerError, StaleHeadError, match_denial_keywords,
                          tokenize)
 except ImportError:  # 直接当脚本跑时
     from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
-                        AUTO_SINK_TYPE_TAG,
+                        AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
                         Ledger, LedgerError, StaleHeadError, match_denial_keywords,
                         tokenize)
 
@@ -106,12 +106,15 @@ PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600"
 MAINTAIN_EVERY = max(1, int(os.environ.get("JJ_MEMORY_MAINTAIN_EVERY", "20") or 20))
 
 # 自动沉淀：每 N 轮（一问一答算一轮）把这几轮的原文按内部规则折成一条 day 记忆。
-# N1 评审后默认 0 = 关：它写的只是「前 60 字原文摘录 + 词面碎片关键词」，
+# N1 评审后默认 0 = 关：它写的只是「前 60 字原文摘录 + 词面碎片关键词」,
 # 没有原文锚也不分会话，当普通事实注入会把索引抬成结论。要开就显式设
 # JJ_MEMORY_AUTO_SINK_EVERY=N；开了也只是索引——写入时打上 type:auto_sink
 # 标记，唤起侧（ledger.activate）按它排除，这些条目进不了系统提示。
+# N2：两个标记（类型标记 + 统一标签）都不参与建图（ledger.is_machine_tag
+# 在唯一建图入口拦下），沉淀条目一条 concept 边也不织，不会把「聊过什么」
+# 的索引连成图谱上的语义同源。
 AUTO_SINK_EVERY = max(0, int(os.environ.get("JJ_MEMORY_AUTO_SINK_EVERY", "0") or 0))
-AUTO_SINK_TAG = "自动沉淀"
+AUTO_SINK_TAG = AUTO_SINK_LABEL  # 字面单一来源在 ledger.AUTO_SINK_LABEL
 
 
 def auto_sink_summary(rows) -> str:
@@ -278,6 +281,9 @@ class MemoryCommitPlugin(Star):
         N1 降级：默认轮次 0（关）；开启后写出的条目也带 AUTO_SINK_TYPE_TAG
         （type:auto_sink）类型标记，统一标签「自动沉淀」保留，唤起侧按标记
         排除，不许把索引当普通事实注入系统提示。
+        N2：两个标记只进 tags 供识别与显式检索（recall 搜「自动沉淀」、
+        auto_sink_ids 精确匹配），建图侧被 ledger.is_machine_tag 拦下——
+        沉淀条目不产生任何 concept 边。
         """
         if AUTO_SINK_EVERY <= 0:
             return {}

@@ -44,6 +44,9 @@ except ModuleNotFoundError:
 # 2026-11-14 N1 降级新增 1 个，只读：
 #   auto_sink_ids（带 type:auto_sink 标记的自动沉淀条目集合，供 activate
 #   五条路线统一排除——索引不进系统提示；不新增任何写路径）。
+# 2026-11-14 N2 修正不动公开面：机器/管理标签退出建图（type: 前缀 +
+# 「自动沉淀」统一标签，ledger.is_machine_tag 在唯一建图入口 _auto_link
+# 拦下），只改私有 _auto_link 与模块级函数，本清单无需变更。
 LEDGER_PUBLIC_METHODS = frozenset({
     "access_history", "activate", "anchor_memory", "append_message",
     "auto_sink_ids",
