@@ -544,6 +544,10 @@ def test_auto_sink_tagged_and_excluded_from_injection(mod, plugin, monkeypatch):
     不是靠标签字符串猜：沉淀条目与普通条目都含「空调」词面、同走
     search 路线，修复后只有普通条目进提示词（对照组），证明排除靠
     类型标记语义，不是整条检索路线坏了。
+
+    N2：标记只用来识别与检索，不进建图——memory_link 里不许出现
+    concept 为 type:auto_sink 或「自动沉淀」的边（机器/管理标签
+    不是语义概念）。
     """
     import main as m
     monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
@@ -558,11 +562,49 @@ def test_auto_sink_tagged_and_excluded_from_injection(mod, plugin, monkeypatch):
     assert row, "沉淀条目没写进去，测试环境坏了"
     assert "自动沉淀" in row["tags"]
     assert "type:auto_sink" in row["tags"]
+    # N2：断言建图结果而不是 tags 字符串——两个标记都不许当 concept
+    edge = plugin.ledger._query_one(
+        "SELECT concept FROM memory_link WHERE concept IN (?, ?)",
+        (m.AUTO_SINK_TYPE_TAG, mod.AUTO_SINK_TAG))
+    assert edge is None, "机器/管理标签不许当 concept 织边（N2）"
     req = _Req("空调")
     asyncio.run(plugin.inject_memory(_Event("空调"), req))
     prompt = req.system_prompt or ""
     assert "自动沉淀" not in prompt
     assert "电视柜" in prompt
+
+
+def test_auto_sink_machine_tags_produce_no_concept_edges(mod, plugin, monkeypatch):
+    """N2：机器/管理标签不参与建图——沉淀条目一条 concept 边也不织。
+
+    探针与实测同形：5 条沉淀（走真实外壳路径，每轮 record_reply 攒一条）
+    + 2 条共享语义标签「咖啡」的正常记忆。修复前 5 条沉淀自己织出
+    20 条边（「自动沉淀」与 type:auto_sink 各 10 条），把「聊过什么」
+    的原文索引抬成图谱上的语义同源；修复后沉淀条目 0 条边，而正常
+    记忆的语义边照常——对照组断言防止「建图整个坏了」被误判成
+    「过滤生效」。
+    """
+    import main as m
+    monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
+    for i in range(5):
+        asyncio.run(plugin.inject_memory(_Event("第 %d 轮：空调开 26 度" % i),
+                                         _Req("第 %d 轮" % i)))
+        asyncio.run(plugin.record_reply(_Event(), _Resp("好，记住了 %d" % i)))
+    plugin.ledger.remember("用户喜欢喝热咖啡", tags="咖啡,饮品", importance=0.8)
+    plugin.ledger.remember("用户下午常去那家咖啡店", tags="咖啡,门店", importance=0.7)
+
+    sink_ids = plugin.ledger.auto_sink_ids()
+    assert len(sink_ids) == 5, "5 轮沉淀没落库，测试环境坏了"
+    links = plugin.ledger._query_all("SELECT * FROM memory_link")
+    concepts = {l["concept"] for l in links}
+    # 建图结果里没有该 concept：类型标记与统一标签都不许当概念
+    assert m.AUTO_SINK_TYPE_TAG not in concepts
+    assert mod.AUTO_SINK_TAG not in concepts
+    # 沉淀条目不产生任何 concept 边：任何边的任一端都不落在沉淀集合里
+    assert not [l for l in links
+                if l["from_id"] in sink_ids or l["to_id"] in sink_ids]
+    # 对照组：正常记忆的语义标签照常织网，过滤没误伤建图本身
+    assert any(l["concept"] == "咖啡" for l in links)
 
 
 def test_auto_sink_excluded_from_fallback_route(mod, plugin, monkeypatch):
