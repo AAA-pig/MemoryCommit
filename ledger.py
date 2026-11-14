@@ -3605,7 +3605,8 @@ class Ledger:
                     pass
 
     def load_jsonl(self, path: str, replace: bool = False,
-                   strict: bool = False) -> Dict[str, Any]:
+                   strict: bool = False, allow_lossy: bool = False
+                   ) -> Dict[str, Any]:
         """把 dump_jsonl 的产物灌回来。
 
         默认只肯往空库里灌：覆盖是有代价的操作，不该是默认行为，
@@ -3615,6 +3616,11 @@ class Ledger:
         导入一律严格——坏行、截断、行数对不上直接报错，落库前先在临时库
         预演一遍 health_check，通过才切换。v1 老备份（没有清单）保持宽容
         兼容：坏行跳过计数。strict=True 可以对老备份也强制严格。
+
+        有损导入策略（P0-3）：备份里带当前库不存在的列，多半是备份来自
+        更新的版本，那列可能影响记忆语义或检索。默认在落库前预检，发现
+        丢列直接拒绝（报错列出 表.列，原库一字节不动）；确认接受降级导入
+        就传 allow_lossy=True，保持旧行为照灌并在结果里如实报告丢列。
         """
         if not path or not os.path.exists(path):
             raise LedgerError("找不到要导入的文件：%s" % path)
@@ -3698,6 +3704,22 @@ class Ledger:
         if existing and not replace:
             raise LedgerError(
                 "这个库已经有 %d 个提交，不覆盖。真想替换就传 replace=True" % existing)
+
+        # 有损导入预检（P0-3）：必须走在一切写之前——预演库也好、正式库也好，
+        # 都不许先写半截再回头拒绝。只读目标库表结构，不动任何数据。
+        if not allow_lossy:
+            lost: List[str] = []
+            for tbl in DUMP_TABLES:
+                if not rows.get(tbl):
+                    continue
+                valid = set(self._table_columns(self._conn, tbl))
+                for row in rows[tbl]:
+                    lost.extend("%s.%s" % (tbl, c) for c in row if c not in valid)
+            lost = sorted(set(lost))
+            if lost:
+                raise LedgerError(
+                    "备份里的列在当前库里不存在，导入会丢数据：%s。"
+                    "确认接受有损导入就传 allow_lossy=True" % "、".join(lost))
 
         if strict_mode:
             # 恢复在临时库验证通过再切换（R5）：预演失败原库一字节不动

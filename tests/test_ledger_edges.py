@@ -579,7 +579,11 @@ def test_load_jsonl_errors(tmp_path, led):
 
 
 def test_load_jsonl_skips_bad_rows_and_reports(tmp_path):
-    """v1 老备份（无完整性清单）保持宽容：坏行跳过计数，不炸整次导入。"""
+    """v1 老备份（无完整性清单）保持宽容：坏行跳过计数，不炸整次导入。
+
+    宽容只宽容「坏行」，不宽容「静默丢列」（P0-3）：未知列在 v1 宽容
+    路径同样预检拒绝，显式 allow_lossy=True 才按旧行为丢掉并计数。
+    """
     target = tmp_path / "t.db"
     src = L.Ledger(str(tmp_path / "src.db"))
     src.remember("搬家用的一条")
@@ -599,7 +603,13 @@ def test_load_jsonl_skips_bad_rows_and_reports(tmp_path):
     dump.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     led = L.Ledger(str(target))
-    res = led.load_jsonl(str(dump))
+    with pytest.raises(L.LedgerError) as err:
+        led.load_jsonl(str(dump))
+    assert "memory.zzz" in str(err.value)
+    assert "allow_lossy=True" in str(err.value)
+    assert led.stats()["memories"] == 0, "预检拒绝后目标库必须一字节没写"
+
+    res = led.load_jsonl(str(dump), allow_lossy=True)
     assert res["skipped"] == 2 and res["memories"] == 1
     assert "memory.zzz" in res["dropped_columns"]
     led.close()
