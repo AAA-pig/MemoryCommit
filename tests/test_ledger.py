@@ -850,7 +850,11 @@ class MigrationTest(unittest.TestCase):
             other.close()
 
     def test_load_drops_unknown_columns(self):
-        """备份里多出来的列（老宿主加的）该被丢掉并计数，而不是让导入整个失败。"""
+        """备份里带目标库没有的列：默认拒绝（P0-3），显式 allow_lossy 才降级。
+
+        旧行为是静默丢列照报成功，「导入成功」三个字把能力降级盖住了。
+        预检必须走在恢复预演之前：不许先建预演库写半截再回头拒绝。
+        """
         self.led.remember("一条")
         p = self._dump_path()
         self.led.dump_jsonl(p)
@@ -867,7 +871,16 @@ class MigrationTest(unittest.TestCase):
 
         other = L.Ledger(os.path.join(self.tmp, "u.db"))
         try:
-            res = other.load_jsonl(p)
+            with self.assertRaises(L.LedgerError) as ctx:
+                other.load_jsonl(p)
+            msg = str(ctx.exception)
+            self.assertIn("memory.legacy_field", msg)
+            self.assertIn("allow_lossy=True", msg)
+            self.assertEqual(other.stats()["memories"], 0,
+                             "预检拒绝后目标库必须一字节没写")
+            self.assertFalse(os.path.exists(os.path.join(self.tmp, "u.db.restore-check")),
+                             "预检必须走在恢复预演之前，不许先建预演库")
+            res = other.load_jsonl(p, allow_lossy=True)
             self.assertEqual(res["memories"], 1)
             self.assertIn("memory.legacy_field", res["dropped_columns"])
         finally:
