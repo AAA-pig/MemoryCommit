@@ -646,6 +646,41 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(errs, [], "并发读写不该报错：%r" % (errs[:3],))
 
 
+class DurabilityTest(unittest.TestCase):
+    """P1-4：持久性档位是显式配置项，不是隐含默认。
+
+    synchronous=NORMAL 之前写死：常见崩溃场景一致，但断电可能丢最近
+    几秒写入。现在默认仍 NORMAL（不改变既有行为），要更强保证显式传
+    FULL；非法值直接拒开——把账本当唯一记忆源的人值得得到明确的错，
+    而不是悄悄降级。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def test_default_is_normal(self):
+        led = L.Ledger(os.path.join(self.tmp, "n.db"))
+        try:
+            self.assertEqual(led.durability, "NORMAL")
+            mode = int(led._conn.execute("PRAGMA synchronous").fetchone()[0])
+            self.assertEqual(mode, 1, "SQLite 里 1 = NORMAL")
+        finally:
+            led.close()
+
+    def test_full_accepted_case_insensitive(self):
+        led = L.Ledger(os.path.join(self.tmp, "f.db"), durability="full")
+        try:
+            self.assertEqual(led.durability, "FULL")
+            mode = int(led._conn.execute("PRAGMA synchronous").fetchone()[0])
+            self.assertEqual(mode, 2, "SQLite 里 2 = FULL")
+        finally:
+            led.close()
+
+    def test_illegal_durability_fails_loudly(self):
+        with self.assertRaises(L.LedgerError):
+            L.Ledger(os.path.join(self.tmp, "x.db"), durability="OFF")
+
+
 class MigrationTest(unittest.TestCase):
     """跨宿主搬库：结构版本要认得出，导出要能原样灌回来。"""
 

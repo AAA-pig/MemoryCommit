@@ -881,3 +881,20 @@ def test_p0_3_wal_checkpoint_shrinks_file(led):
     assert led.wal_bytes() <= before
     # 冷却期内不重复截断
     assert led.maybe_checkpoint_wal(threshold=1)["reason"] in ("还在冷却里", "wal 未超阈值")
+
+
+def test_time_contract_is_local_time_known_limit():
+    """P1-5：固定「本地时间、无时区偏移」这个已知限制，不是理想状态。
+
+    now_str 不带偏移后缀；_parse_time 把它按运行机器本地时区（mktime
+    语义）折回同一个绝对时刻。跨时区搬库后同一串时间会算出不同的
+    绝对年龄——这是既有限制。哪天统一改 UTC，这条测试就是第一个
+    要改写的见证：它红了，说明时间契约变了，记得核对存量数据解释。
+    """
+    s = L.now_str()
+    assert len(s) == 19
+    assert not s.endswith(("Z", "z"))
+    assert "+" not in s[10:] and s[10] == "T"
+    parsed = L._parse_time(s)
+    expect = time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
+    assert parsed == expect, "解析必须走 mktime 的本地时区语义（现契约）"

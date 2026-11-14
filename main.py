@@ -105,6 +105,13 @@ PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600"
 # 导出本身跨天才真写文件，换班与截断也有冷却，节流省的是每轮那几次空查询。
 MAINTAIN_EVERY = max(1, int(os.environ.get("JJ_MEMORY_MAINTAIN_EVERY", "20") or 20))
 
+# SQLite 持久性档位（P1-4）：NORMAL 偏性能——常见崩溃场景一致，断电可能
+# 丢最近几秒写入；FULL 每次同步落盘，断电几乎不丢，代价是每次写入都付
+# fsync。把账本当唯一记忆源、丢几秒都心疼的就设 FULL。
+# 非法值会在 Ledger.__init__ 里直接拒开（显式失败，不猜）。
+DURABILITY = (os.environ.get("JJ_MEMORY_DURABILITY", "NORMAL").strip().upper()
+              or "NORMAL")
+
 # 自动沉淀：每 N 轮（一问一答算一轮）把这几轮的原文按内部规则折成一条 day 记忆。
 # N1 评审后默认 0 = 关：它写的只是「前 60 字原文摘录 + 词面碎片关键词」,
 # 没有原文锚也不分会话，当普通事实注入会把索引抬成结论。要开就显式设
@@ -243,7 +250,7 @@ class MemoryCommitPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.ledger = Ledger(str(DB_PATH))
+        self.ledger = Ledger(str(DB_PATH), durability=DURABILITY)
         # 画像块一小时才注入一次，免得每轮都念同样的「用户的事」
         self._profile_injected_at = 0.0
         self.BRIEF_BUDGET = 420

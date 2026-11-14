@@ -255,7 +255,9 @@ SCHEMA_STATEMENTS = (
         how TEXT NOT NULL DEFAULT '')""",
     # 原文链：一条消息一个节点，digest 吃上一条的 digest，改一个字整条对不上。
     # 故意不进提交链——一天几百条消息塞进 mcommit，「记忆的历史」会被稀释成消息流水。
-    # 它要的是不可篡改、查得到原话，不是能回滚，所以用哈希链而不是 commit。
+    # 它要的是篡改检测与内部一致性校验（单条改动、中间删除、尾部截断都查得出）、
+    # 查得到原话，不是能回滚，所以用哈希链而不是 commit。边界说清楚（P0-2）：
+    # 防不住能同时改消息、digest、链头并重算整条链的人，也不等于来源可信。
     """CREATE TABLE IF NOT EXISTS message (
         id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL DEFAULT '',
@@ -563,6 +565,13 @@ class StaleHeadError(LedgerError):
 
 
 def now_str() -> str:
+    """当前时间的账本字符串：本地时间、无时区偏移（P1-5 已知契约）。
+
+    账本里所有时间戳都是这个格式：写的是哪台机器的本地时间，没有时区
+    偏移。跨时区搬库后这些字符串会被新机器按自己的时区解释，时间差、
+    每日导出日期、访问窗口都可能偏——这是既有的已知限制，统一改 UTC
+    要牵动存量数据的解释，本轮不动它。
+    """
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
@@ -572,6 +581,10 @@ def _parse_time_cached(text: str) -> float:
 
     strptime 一次要几十微秒，两千条记忆每轮要解析几千次，光这一项就吃掉近半时间。
     解析不出来返回 0，让调用方自己决定退回「现在」。
+
+    时区契约（P1-5）：time.mktime 把无偏移的本地时间字符串按「运行机器
+    的本地时区」解释，跨时区搬库后同一串时间会算出不同的绝对年龄；
+    存量数据都是本地时间，统一改 UTC 是迁移级改动，本轮不动它。
     """
     for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
         try:
@@ -582,6 +595,7 @@ def _parse_time_cached(text: str) -> float:
 
 
 def _parse_time(value: Any) -> float:
+    """时间值 → 时间戳；int/float 直通，字符串按运行机器本地时区解释（P1-5）。"""
     if isinstance(value, (int, float)):
         return float(value)
     if not value:
@@ -1517,7 +1531,19 @@ def _row_key_fields(row_key: str) -> Dict[str, str]:
 class Ledger:
     ASSOC_DEPTH = 2  # 联想最多走两步：想到的事，还想得起它连着的事
 
-    def __init__(self, db_path: str):
+    # synchronous 档位（P1-4）：NORMAL 偏性能——常见崩溃场景一致，断电
+    # 可能丢最近几秒写入；FULL 每次同步落盘，断电几乎不丢，代价是每次
+    # 写入都付一次 fsync。档位是显式配置项，非法值直接拒开，不猜。
+    DURABILITY_LEVELS = ("NORMAL", "FULL")
+
+    def __init__(self, db_path: str, durability: str = "NORMAL"):
+        durability = (durability or "").strip().upper()
+        if durability not in self.DURABILITY_LEVELS:
+            raise LedgerError(
+                "durability 只接受 NORMAL/FULL，收到：%r。NORMAL 偏性能"
+                "（断电可能丢最近几秒写入），FULL 每次同步落盘"
+                "（断电几乎不丢，代价是每次写入都付 fsync）" % (durability,))
+        self.durability = durability
         self.db_path = os.path.abspath(db_path)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._lock = threading.RLock()
@@ -1525,7 +1551,7 @@ class Ledger:
                                      isolation_level=None, timeout=15)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA synchronous=%s" % self.durability)
         # 唤起冷却：刚浮现过的记忆，短时间内不再重复浮现
         self._surfaced: Dict[str, float] = {}
         # 切词缓存：memory_id -> (原文, tokens)。原文变了就不命中，等于自带失效；
@@ -2543,8 +2569,11 @@ class Ledger:
         """往原文链尾部接一条消息，返回新节点。
 
         不进提交链是有意的：一天几百条消息塞进 mcommit，
-        「记忆的历史」会被稀释成流水账。这里要的是不可篡改、查得到原话，
-        不是能回滚，所以用哈希链——digest 吃上一条的 digest。
+        「记忆的历史」会被稀释成流水账。这里要的是篡改检测与内部
+        一致性校验（改一个字、删中间一条、砍尾巴都查得出）、查得到
+        原话，不是能回滚，所以用哈希链——digest 吃上一条的 digest。
+        它不防重算整条链（能同时改消息、digest、链头的人查不出来），
+        也不等于来源可信；更强的保证要靠库外的独立锚定，这里没有。
         """
         content = (content or "").strip()
         if not content:
