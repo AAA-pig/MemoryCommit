@@ -459,6 +459,46 @@ def test_health_check_reconciles_all_projections(led):
     assert any("投影对账不一致" in p and "clue" in p for p in hc["problems"])
 
 
+def test_replay_delete_identifies_row_by_row_key(led):
+    """R4：删除行的身份只能来自 row_key——before 缺身份字段的老数据也认得出。
+
+    两条 memory_link 边同 from/to、只有 concept 不同（其余字段完全一样）；
+    删除行按老版 forget 的写法只存 strength，没有 from/to/concept 身份。
+    把重放改成不解析 row_key（退回 before 拼身份，或按 from/to 粗匹配）时，
+    这条测试必红：前者删不掉那条边（幽灵残留，health 对账也炸），
+    后者会把没删的那条也误删。
+    """
+    led.remember("小明喜欢篮球", tags="篮球,比赛")
+    led.remember("小明参加了篮球比赛", tags="篮球,比赛")
+    edges = [dict(r) for r in led._query_all(
+        "SELECT * FROM memory_link ORDER BY concept")]
+    assert len(edges) >= 2, "两条共享两标签的记忆该织出至少两条同 from/to 的边"
+    victim, keep = edges[0], edges[1]
+    assert {victim["from_id"], victim["to_id"]} == {keep["from_id"], keep["to_id"]}, \
+        "两条边要在其余字段上尽量相同、只有 row_key 身份不同"
+    with led.commit("老版 forget：删掉其中一条边") as cb:
+        cb.unlink_edge({"id": victim["id"], "from_id": victim["from_id"],
+                        "to_id": victim["to_id"], "concept": victim["concept"],
+                        "strength": victim["strength"]})
+    # 复原老版数据形态：before 只剩 strength，row_key 是唯一可靠身份来源
+    with led._tx() as cx:
+        cx.execute("UPDATE commit_row SET before_json = ?"
+                   " WHERE op = 'delete' AND tbl = 'memory_link'",
+                   (json.dumps({"strength": victim["strength"]}),))
+    row = led._query_one(
+        "SELECT row_key FROM commit_row WHERE op = 'delete' AND tbl = 'memory_link'")
+    assert "concept=%s" % victim["concept"] in (row["row_key"] or ""), \
+        "删除行 row_key 必须带完整行身份"
+    replay = led._replay_tables(led.head())
+    lk = replay.get("memory_link", {})
+    v_key = "%s|%s|%s" % (victim["from_id"], victim["to_id"], victim["concept"])
+    k_key = "%s|%s|%s" % (keep["from_id"], keep["to_id"], keep["concept"])
+    assert v_key not in lk, "重放删的必须是 row_key 指定的那一条"
+    assert k_key in lk, "没删的那条必须还在"
+    hc = led.health_check()
+    assert hc["ok"], hc["problems"]
+
+
 # -- R5：备份完整性 -----------------------------------------------------------
 
 def _roundtrip_source(tmp_path):
@@ -601,6 +641,35 @@ def test_load_v2_rejects_table_count_mismatch(led, tmp_path):
         led.load_jsonl(p)
     assert "memory 表行数对不上" in str(ei.value)
     assert led.stats()["commits"] == 0
+
+
+def test_load_v2_eof_only_truncation_rejected(led, tmp_path):
+    """R5：v2 备份只截掉尾部 __eof__ 标记也必须明确判失败。
+
+    数据行全在、清单全对得上——行数校验对这种截断无感，eof 检查是
+    独立防线，不能指望行数校验兜底。先验完整文件能通过（对照），
+    再验截掉 eof 就拒，且原因可读、原库一字节不动。
+    """
+    src = _roundtrip_source(tmp_path)
+    p = str(tmp_path / "b.jsonl")
+    src.dump_jsonl(p)
+    src.close()
+    lines = open(p, encoding="utf-8").read().splitlines()
+    assert json.loads(lines[-1])["t"] == "__eof__"
+    # 对照组：完整文件能通过
+    other = L.Ledger(str(tmp_path / "ok.db"))
+    try:
+        assert other.load_jsonl(p)["verified"] is True
+    finally:
+        other.close()
+    # 只截掉尾部标记，数据行与清单一个不少
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines[:-1]) + "\n")
+    with pytest.raises(L.LedgerError) as ei:
+        led.load_jsonl(p)
+    msg = str(ei.value)
+    assert "__eof__" in msg or "截断" in msg, "要给出可读的失败原因：" + msg
+    assert led.stats()["commits"] == 0, "被拒的导入不许动原库"
 
 
 def test_restore_check_tolerates_stale_temp_file_cleanup_failure(led, tmp_path,

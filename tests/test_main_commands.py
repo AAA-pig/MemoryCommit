@@ -342,6 +342,51 @@ def test_tool_happy_paths(plugin):
     assert "没有相关" in _call(plugin.memory_search, "量子")
 
 
+# -- N11：type: 保留前缀要告诉模型 -------------------------------------------
+
+def test_memory_write_docstring_documents_type_prefix(plugin):
+    """N11：工具描述必须写明 type: 是保留前缀——不参与连边、不当语义概念。
+
+    模型很爱写 type:preference 这类标签，没这句说明它只会发现两条记忆
+    之间没有边、不知道原因。这条测试防止说明以后又被改回去。
+    """
+    doc = plugin.memory_write.__doc__ or ""
+    assert "保留前缀" in doc, "工具描述丢了 type: 保留前缀的说明"
+    assert "不参与连边" in doc
+    assert "语义" in doc
+
+
+def test_memory_write_warns_on_type_prefix_tags(plugin):
+    """N11：写入返回文本提醒 type: 标签不参与建图；普通标签不多嘴。"""
+    out = _call(plugin.memory_write, "喜欢在深夜写代码", tags="type:preference")
+    assert out.startswith("已写入")
+    assert "type:" in out and "不参与" in out, "带 type: 标签的写入要带提醒：" + out
+    plain = _call(plugin.memory_write, "白天喜欢喝茶", tags="偏好")
+    assert plain.startswith("已写入")
+    assert "不参与" not in plain, "普通标签的写入不该多出提醒"
+
+
+def test_type_prefixed_tags_make_no_edges_with_control(plugin):
+    """N11：两条 type:preference 记忆之间 0 条边；同样两条写普通标签有边。
+
+    对照组防止「建图整个坏了」被误判成「过滤生效」；末尾断言防止普通
+    标签的边牵到 type: 标签的记忆上。
+    """
+    led = plugin.ledger
+    t1 = led.remember("她喜欢猫", tags="type:preference")["memory_id"]
+    t2 = led.remember("她讨厌吵闹的狗", tags="type:preference")["memory_id"]
+    assert led._query_one("SELECT COUNT(*) AS n FROM memory_link")["n"] == 0, \
+        "两条 type: 前缀标签的记忆之间不许有边"
+    a = led.remember("他喜欢猫", tags="宠物")["memory_id"]
+    b = led.remember("他讨厌吵闹的狗", tags="宠物")["memory_id"]
+    links = led._query_all("SELECT * FROM memory_link")
+    assert [l for l in links if {l["from_id"], l["to_id"]} == {a, b}], \
+        "同样两条写普通标签的记忆之间应该有边（对照组）"
+    stray = [l for l in links
+             if l["from_id"] in (t1, t2) or l["to_id"] in (t1, t2)]
+    assert not stray, "普通标签不许连到 type: 标签的记忆上"
+
+
 # -- 注入 ------------------------------------------------------------------
 
 class _Req:

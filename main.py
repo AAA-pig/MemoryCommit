@@ -813,7 +813,9 @@ class MemoryCommitPlugin(Star):
 
         Args:
             content(string): 要记住的事，一句话说清楚，不超过 200 字
-            tags(string): 概念标签，逗号分隔。标签相同的历史记忆会自动连边
+            tags(string): 概念标签，逗号分隔。标签相同的历史记忆会自动连边；
+                type: 开头的标签是保留前缀，用于内部类型标记，不参与连边、
+                也不会被当成语义概念，要标记语义请用普通词
             level(string): 时间粒度，只能是 topic/day/week/month/quarter/year，默认 day
             importance(float): 重要性 0-1，默认 0.5；核心事实给 0.85 以上会被钉住不淘汰
         """
@@ -829,8 +831,19 @@ class MemoryCommitPlugin(Star):
                 anchor_seq=getattr(event, "_mc_anchor_seq", 0))
         except LedgerError as e:
             return "没写进去：%s" % e
-        return "已写入 %s（提交 %s），标签：%s" % (
-            res["memory_id"], res["commit"], tags or "无")
+        # N11：模型写了 type: 前缀标签时当场提醒，免得它回头发现两条
+        # 记忆之间没有边却不知道原因。分隔符与 ledger._split_tags 同一形态。
+        if isinstance(tags, (list, tuple, set)):
+            tag_items = [str(t) for t in tags]
+        elif isinstance(tags, str):
+            tag_items = re.split(r"[,，、;；\s]+", tags)
+        else:
+            tag_items = []
+        note = ""
+        if any(t.strip().startswith("type:") for t in tag_items if t and t.strip()):
+            note = "；提醒：type: 开头的标签是内部类型标记，不参与连边建图"
+        return "已写入 %s（提交 %s），标签：%s%s" % (
+            res["memory_id"], res["commit"], tags or "无", note)
 
     @filter.llm_tool(name="memory_search")
     async def memory_search(self, event: AstrMessageEvent, query: str,
