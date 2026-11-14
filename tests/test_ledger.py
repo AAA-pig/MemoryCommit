@@ -779,6 +779,76 @@ class MigrationTest(unittest.TestCase):
         with self.assertRaises(L.LedgerError):
             self.led.load_jsonl(p)
 
+    def test_dump_load_roundtrip_access_log(self):
+        """P0-1：访问明细是备份的一部分，搬家后近期行为要能原样接上。
+
+        v3 之前 access_log 不进 DUMP_TABLES，dump→load 后明细清零：
+        工作记忆复出、近期命中都按时间窗口吃它的行，「整本原样搬家」
+        就成了半截账本。这里连 id 都要比对（AUTOINCREMENT 断号也算搬丢）。
+        """
+        self._seed()
+        rows = self.led._query_all("SELECT id FROM memory ORDER BY id")
+        m1, m2 = rows[0]["id"], rows[1]["id"]
+        self.led.touch_many([m1, m2], query="空调", how="search")
+        self.led.touch_many([m1], query="", how="activate")
+        # 直插两条跨时间窗口的旧记录，防止「只剩今天」的假往返
+        with self.led._tx() as cx:
+            cx.execute("INSERT INTO access_log(memory_id, at, seq, query, how)"
+                       " VALUES(?,?,?,?,?)",
+                       (m2, "2026-01-01T08:00:00", 0, "结算", "recall"))
+            cx.execute("INSERT INTO access_log(memory_id, at, seq, query, how)"
+                       " VALUES(?,?,?,?,?)",
+                       (m1, "2025-12-01T23:30:00", 0, "", "fallback"))
+        before = [dict(r) for r in self.led._query_all(
+            "SELECT * FROM access_log ORDER BY id")]
+        self.led.dump_jsonl(self._dump_path())
+
+        other = L.Ledger(os.path.join(self.tmp, "a.db"))
+        try:
+            res = other.load_jsonl(self._dump_path())
+            self.assertEqual(res["tables"].get("access_log"), len(before))
+            after = [dict(r) for r in other._query_all(
+                "SELECT * FROM access_log ORDER BY id")]
+            self.assertEqual(before, after)
+            self.assertEqual(other.stats()["accesses"], len(before))
+            hc = other.health_check()
+            self.assertTrue(hc["ok"], hc["problems"])
+        finally:
+            other.close()
+
+    def test_load_v2_backup_without_access_log_still_imports(self):
+        """v2 老备份没有 access_log 段，新代码要照常导入（P0-1 兼容面）。
+
+        反方向（旧代码读到 v3 备份）由 test_load_rejects_newer_dump_version
+        钉住：文件头 version > DUMP_VERSION 直接拒收，v3 备份喂给只认 v2
+        的旧代码走的就是同一条路径。
+        """
+        self._seed()
+        first_id = self.led._query_all(
+            "SELECT id FROM memory ORDER BY id")[0]["id"]
+        self.led.touch_many([first_id], query="空调", how="search")
+        text = self.led.dump_jsonl()
+        lines = [ln for ln in text.splitlines() if '"t": "access_log"' not in ln]
+        header = json.loads(lines[0])
+        self.assertIn("access_log", header["tables"])
+        lost = header["tables"].pop("access_log")
+        header["version"] = 2
+        header["rows_total"] -= lost
+        lines[0] = json.dumps(header, ensure_ascii=False, sort_keys=True)
+        p = self._dump_path()
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+        other = L.Ledger(os.path.join(self.tmp, "v2.db"))
+        try:
+            res = other.load_jsonl(p)
+            self.assertEqual(res["memories"], 2)
+            self.assertEqual(other.stats()["accesses"], 0,
+                             "老备份本来就没带访问明细，别假装恢复出来了")
+            self.assertTrue(other.recall("空调"))
+        finally:
+            other.close()
+
     def test_load_drops_unknown_columns(self):
         """备份里多出来的列（老宿主加的）该被丢掉并计数，而不是让导入整个失败。"""
         self.led.remember("一条")
