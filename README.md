@@ -210,6 +210,8 @@ LLM 工具（仅限授权会话私聊）：
 
 **结构版本**：`meta.schema_version` 跟着库走，不跟代码走。老库没这个键会被认成 0 号，自动升到当前版本（升之前不碰任何投影表）。当前版本号以 `ledger.py` 里的 `SCHEMA_VERSION` 为准（现在是 v6：在 v5 的否认/状态档/原文锚/梦骨架之上加了创作项目旁路表 `creative`，纯加法、幂等）。反过来，**库比代码新就拒绝打开**——迁移是单向的，硬开只会把新列悄悄丢掉。
 
+升级 5→6 的完整流程（三件套备份的确切命令、副本预演的逐表行数对照表、卸载 → 重载 → 验证的七步清单与判定阈值、回滚条件）见 `docs/升级-schema5-to-6-方案.md`。那里第 0 节有一条踩过的坑：**只读探真库要写 `file:...?mode=ro`，不能加 `immutable=1`**——加了会跳过 WAL，读到 checkpoint 之前的旧快照，看着就像「迁移没跑」。
+
 **dump / load**：`/记忆备份` 写一份 JSONL，头一行是文件头（格式名、格式版本、结构版本、接口版本、每表行数清单、总行数），之后一行一条记录，最后一行是 `__eof__` 尾部标记。导入 v2 及以后的备份一律严格：坏行、截断、行数对不上直接报错，落库前先在临时库预演一遍 `health_check`，通过才切换（原库全程不写）；v1 老备份保持宽容兼容。
 
 **备份格式版本**：当前 `DUMP_VERSION = 4`。v2 加了行数清单与 `__eof__`，v3 把 `access_log` 纳入备份，v4（2026-11-15）把 `creative` 纳入备份——创作正文与原始档也在里面。**新版代码能读旧备份，旧版代码读不了新备份**：v4 备份在只认 v3 的旧代码里会被文件头拒收，先升级代码再导入。v3 及更早的备份里没有创作项目，导入后 `creative` 表为空——这是「本来就没有」，不是恢复失败（`warnings` 会写一句）。
@@ -249,24 +251,27 @@ python -m pytest tests/ -q
 
 ### 覆盖率口径
 
-只统计 `ledger.py` / `main.py` / `conftest.py` 三个文件；`tests/` 自身不计入（测试代码给自己刷覆盖率没有意义）。口径是**行 + 分支双 100%**：
+**生产门禁**只统计 `ledger.py` / `main.py` 两个文件；`tests/` 自身不计入（测试代码给自己刷覆盖率没有意义）。口径是**行 + 分支双 100%**：
 
 ```bash
 python -m coverage run --branch --source=. -m pytest -q
-python -m coverage report --include="ledger.py,main.py,conftest.py" -m
-python -m coverage report --include="ledger.py,main.py,conftest.py" --fail-under=100
+python -m coverage report --include="ledger.py,main.py" -m
+python -m coverage report --include="ledger.py,main.py" --fail-under=100
 ```
+
+`conftest.py` 是 pytest 的夹具与环境钩子，**不随插件发布**，所以默认不进 100% 门禁，只在门禁通过后单独报一次数字（`coverage_check.ps1` 会打印一行 `参考（不计入门禁）：conftest.py`）。把它并进同一个总账，只会让「生产代码覆盖率」这个数字好看，却掩盖真正要盯的 `ledger.py` / `main.py`；它的行为仍由「测试全绿」兜底。需要老的「三件套一起卡 100」时加 `-IncludeConftest`。
 
 只需要装 `coverage`，**不用** pytest-cov 插件，解释器是哪个都行。`-m` 那行会把没走到的分支逐条列成 `行->行`，补测试对着它打就行。
 
-Windows 上用封装脚本（不给 `-Python` 就自己找装了 coverage 的解释器：先看 `$env:PYTHON`，再试 PATH 里的 `python`、`python3`，每个都实地跑一遍 `-m coverage --version` 验过才用；全找不到会明确报错，让你用 `-Python` 指过去）：
+Windows 上用封装脚本。`coverage_check.ps1` 与 `rollback_drill.ps1` 共用同一份探测器 `tools/resolve_python.ps1`（不各写一份硬编码路径），不给 `-Python` 就按 `$env:PYTHON` → `$RepoRoot\.venv\Scripts\python.exe` → PATH 里的 `python`、`python3` 逐个实地验证，第一个合格的才用；全找不到会明确报错，让你用 `-Python` 指过去：
 
 ```powershell
 .\tools\coverage_check.ps1
 .\tools\coverage_check.ps1 -Python "C:\path\to\python.exe"   # 显式指定，跳过探测
+.\tools\coverage_check.ps1 -IncludeConftest                  # conftest 也计入 100% 门禁
 ```
 
-脚本先跑全量测试，再按上面的 include 报覆盖率，`--fail-under=100` 不达标就非 0 退出。当前状态：**行 2765/2765、分支 1096/1096 双 100%**，`--fail-under=100` 退出码 0。上一版遗留的那个 partial（`ledger.py` 904→912，`classify_conflict` 里被前两条提前 return 挡住的死分支）已经用**等价重构**消掉——删掉恒真条件、把 body 平铺，注释写明「能走到这里，前提是 892/895 两处提前返回仍在」，`tests/test_classify_conflict_guards.py` 把这个前提钉成了用例，没有用 `pragma: no cover` 遮盖。
+脚本先跑全量测试，再按上面的 include 报覆盖率，`--fail-under=100` 不达标就非 0 退出。上一版遗留的那个 partial（`ledger.py` 904→912，`classify_conflict` 里被前两条提前 return 挡住的死分支）已经用**等价重构**消掉——删掉恒真条件、把 body 平铺，注释写明「能走到这里，前提是 892/895 两处提前返回仍在」，`tests/test_classify_conflict_guards.py` 把这个前提钉成了用例，没有用 `pragma: no cover` 遮盖。
 
 覆盖率数据是**本机测量产物，不是源码**：`.coverage` / `.coverage.*` 已进 `.gitignore`。请只在沙盒/临时副本里跑 pytest 与 coverage，**不要在运行中的插件目录跑**——那会往生产目录里扔未跟踪的 `.coverage`。
 

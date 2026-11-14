@@ -1,84 +1,66 @@
 ﻿# -*- coding: utf-8 -*-
 <#
-覆盖率门禁：只统计 ledger.py / main.py / conftest.py，行 + 分支双 100%。
+覆盖率门禁：统计 ledger.py / main.py 的行 + 分支双 100%，conftest.py 单独标注。
 
 口径：
   --branch                 分支覆盖也算，不只看行
   --source=.               只收本仓库的代码
-  --include=...            只报这三个文件；tests/ 自身不计入
+  --include=...            只报统计范围内的文件；tests/ 自身不计入
   report --fail-under=100  低于 100 就非 0 退出
 
+为什么 conftest.py 单独拿出来标注（而不是并进「生产代码三大件」）：
+  conftest.py 是 pytest 的测试夹具/环境钩子，不是随插件发布的生产逻辑。
+  把它算进同一个 100% 总账，只会让「生产代码覆盖率」这个数字好看，
+  却掩盖了真正需要盯的 ledger.py / main.py。所以：
+    - 生产门禁 = ledger.py + main.py，--fail-under=100，非 0 直接失败；
+    - conftest.py 单独跑一次 report，只展示数字（附 CONFTEST_LINE 字样），
+      不计入门禁、不影响退出码。它的行为仍由测试全绿兜底。
+  需要老的「三件套一起卡 100」行为时加 -IncludeConftest。
+
 为什么不用 pytest-cov：它不是必需的，装了 coverage 就能跑这套命令；
-  所以这里要的是一个「装了 coverage 的 python」，谁装都行，脚本自己找：
+  所以这里要的是一个「装了 coverage 的 python」。
+  探测逻辑在 tools/resolve_python.ps1，与 rollback_drill.ps1 共用：
     1) 环境变量 PYTHON
-    2) PATH 里的 python
-    3) PATH 里的 python3
+    2) $RepoRoot\.venv\Scripts\python.exe
+    3) PATH 里的 python
+    4) PATH 里的 python3
   逐个用 -m coverage --version 验证，第一个能跑的就用；全失败才报错。
 
 用法：
   .\tools\coverage_check.ps1
   .\tools\coverage_check.ps1 -Python "C:\path\to\python.exe"   # 显式指定，跳过探测
   .\tools\coverage_check.ps1 -KeepData     # 保留 .coverage，方便自己再跑 report -m
+  .\tools\coverage_check.ps1 -IncludeConftest   # conftest 也计入 100% 门禁
 #>
 [CmdletBinding()]
 param(
     [string]$RepoRoot,
     [string]$Python,
-    [switch]$KeepData
+    [switch]$KeepData,
+    [switch]$IncludeConftest
 )
 
 $ErrorActionPreference = "Stop"
 
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
 
-function Test-CoveragePython {
-    <#
-    这个解释器能不能跑 `-m coverage --version`。
-    路径不存在、启动失败、返回码非 0、输出里没有 Coverage.py，一律算不能。
-    #>
-    param([string]$Exe)
-    if ([string]::IsNullOrWhiteSpace($Exe)) { return $false }
-    if (-not (Test-Path -LiteralPath $Exe)) { return $false }
-    try {
-        $out = & $Exe -m coverage --version 2>&1
-        if ($LASTEXITCODE -ne 0) { return $false }
-        return (($out | Out-String) -match "Coverage\.py")
-    } catch {
-        return $false
-    }
-}
-
-function Resolve-PythonExe {
-    <#
-    先认命令行名字（python / python3）成绝对路径，再交给 Test-CoveragePython 验。
-    返回第一个能跑 coverage 的绝对路径；一个都没有返回 $null。
-    #>
-    $candidates = New-Object System.Collections.Generic.List[string]
-    if (-not [string]::IsNullOrWhiteSpace($env:PYTHON)) { $candidates.Add($env:PYTHON) }
-    foreach ($name in @("python", "python3")) {
-        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($cmd) { $candidates.Add($cmd.Source) }
-    }
-
-    foreach ($exe in $candidates) {
-        if (Test-CoveragePython -Exe $exe) { return $exe }
-    }
-    return $null
-}
+. (Join-Path $PSScriptRoot "resolve_python.ps1")
 
 if ([string]::IsNullOrWhiteSpace($Python)) {
-    $Python = Resolve-PythonExe
-    if (-not $Python) {
-        throw "没找到装了 coverage 的 python（试过 PYTHON 环境变量、python、python3）。用 -Python 指定解释器路径。"
-    }
+    $Python = Resolve-PythonExeOrThrow -RequireModules @("coverage") -RepoRoot $RepoRoot -Hint "用 -Python 指定解释器路径。"
     Write-Host "[coverage_check] 使用解释器：$Python"
-} elseif (-not (Test-CoveragePython -Exe $Python)) {
+} elseif (-not (Test-PythonModule -Exe $Python -Module "coverage")) {
     throw "指定的 python 跑不了 -m coverage --version：$Python"
 }
 
 $env:PYTHONIOENCODING = "utf-8"
 $dataFile = Join-Path $RepoRoot ".coverage"
 if (-not $KeepData -and (Test-Path $dataFile)) { Remove-Item $dataFile -Force }
+
+# 生产门禁文件：conftest.py 是测试夹具，默认不进总账
+$gateFiles = @("ledger.py", "main.py")
+if ($IncludeConftest) { $gateFiles += "conftest.py" }
+$gateInclude = ($gateFiles -join ",")
 
 Push-Location $RepoRoot
 try {
@@ -88,13 +70,20 @@ try {
         exit $LASTEXITCODE
     }
 
-    & $Python -m coverage report --include="ledger.py,main.py,conftest.py" --fail-under=100
+    Write-Host "[coverage_check] 生产代码门禁：$gateInclude"
+    & $Python -m coverage report --include="$gateInclude" --fail-under=100
     $code = $LASTEXITCODE
 
+    if (-not $IncludeConftest) {
+        # conftest.py 单独展示，只做标注不影响退出码
+        Write-Host "[coverage_check] 参考（不计入门禁）：conftest.py"
+        & $Python -m coverage report --include="conftest.py"
+    }
+
     if ($code -eq 0) {
-        Write-Host "[coverage_check] 行 + 分支 100%，过"
+        Write-Host "[coverage_check] $gateInclude 行 + 分支 100%，过"
     } else {
-        Write-Host "[coverage_check] 未到 100%（退出码 $code）：用 coverage report -m 看缺哪条分支"
+        Write-Host "[coverage_check] $gateInclude 未到 100%（退出码 $code）：用 coverage report -m 看缺哪条分支"
     }
     exit $code
 }
