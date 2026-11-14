@@ -38,7 +38,7 @@ except ImportError:  # 直接当脚本跑时
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
 # 版本号单一来源是 metadata.yaml；这里与之保持一致（一致性由
 # tests/test_r_fixes.py::test_versions_single_source 钉住，改版本要三处同步）
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.5.1"
 
 # 账本放在插件外面，换插件、换版本都不会丢，也方便人直接翻
 DATA_DIR = Path(os.environ.get(
