@@ -60,8 +60,13 @@ CORE_API_VERSION = 2
 # v2（R5）：文件头带每表行数清单与总行数，尾部加 __eof__ 标记；
 # 导入 v2 一律严格校验（坏行/截断/行数不符报错，落库前先在临时库预演），
 # v1 老备份保持宽容兼容（坏行跳过计数）。
+# v3（P0-1）：access_log 纳入备份。它虽是体温计不是账本，但近期命中、
+# 工作记忆复出、访问审计都吃它的明细，少了它「整本原样搬家」就是谎报。
+# 破坏性变更：旧代码（只认 v2）读到 v3 备份会在文件头拒收——
+# 「备份格式 v3 比当前支持的 v2 新」；反之 v2 老备份没有 access_log 段，
+# 新代码照收，只是访问明细不在里面（这正是当年那个洞）。
 DUMP_FORMAT = "jj-memory-dump"
-DUMP_VERSION = 2
+DUMP_VERSION = 3
 
 # 搬家时要带走的表，顺序按「先元信息、后投影」，导入时不会因为顺序互相绊住
 DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
@@ -70,7 +75,11 @@ DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
                # v5：职守状态与梦。这些不是体温计，是「判决与证据」——
                # 状态档丢了会冤枉记忆，否认丢了会放跑幻觉，锚丢了断回原文的路。
                "memory_condition", "memory_status", "dream_proposal",
-               "memory_source_anchor", "user_denial")
+               "memory_source_anchor", "user_denial",
+               # v3（P0-1）：access_log 是运行状态不是事实，但近期命中与
+               # 工作记忆复出按时间窗口吃它的明细，备份丢了它，迁移前后
+               # 的行为就对不上——体温计的读数历史也是要搬家的。
+               "access_log")
 
 # 每张表导出时的稳定排序，纯粹为了 diff 好看，往返不依赖顺序
 _DUMP_ORDER = {
@@ -89,6 +98,7 @@ _DUMP_ORDER = {
     "dream_proposal": "created_at, id",
     "memory_source_anchor": "memory_id, message_seq",
     "user_denial": "id",
+    "access_log": "id",
 }
 
 # meta 里属于「这台机器此刻的状态」而不属于「账本内容」的键，导出时跳过
