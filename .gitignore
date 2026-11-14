@@ -26,3 +26,8 @@ venv/
 backups/
 # 回滚演练产物（每次实跑都会重写）
 tools/drill_out/
+# 覆盖率数据：本机测量结果，不是源码（pytest-cov 每次跑都会重写 .coverage）
+.coverage
+.coverage.*
+# 本轮临时件（备份/对照/脚本草稿都放这里）
+.temp/

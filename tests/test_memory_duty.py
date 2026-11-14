@@ -50,6 +50,9 @@ except ModuleNotFoundError:
 # 2026-11-14 N2 修正不动公开面：机器/管理标签退出建图（type: 前缀 +
 # 「自动沉淀」统一标签，ledger.is_machine_tag 在唯一建图入口 _auto_link
 # 拦下），只改私有 _auto_link 与模块级函数，本清单无需变更。
+# 2026-11-15 v6 新增 3 个（schema v6 创作项目旁路表 creative）：
+#   upsert_creative（唯一写口，旁路表直写不进提交链，不碰 memory 表）
+#   + get_creative / list_creatives（只读）。经本轮任务评审入清单。
 LEDGER_PUBLIC_METHODS = frozenset({
     "access_history", "activate", "anchor_memory", "append_message",
     "auto_sink_ids",
@@ -57,15 +60,15 @@ LEDGER_PUBLIC_METHODS = frozenset({
     "denial_history", "denied_ids", "deny_memory", "deny_revoke", "disputed_ids",
     "dream_add_memory",
     "dream_apply", "dream_produced_ids", "dump_jsonl", "export_markdown",
-    "flush", "flush_plan", "forget", "head", "health_check", "history",
-    "load_jsonl", "materialize", "max_created_seq", "maybe_checkpoint_wal",
+    "flush", "flush_plan", "forget", "get_creative", "head", "health_check", "history",
+    "list_creatives", "load_jsonl", "materialize", "max_created_seq", "maybe_checkpoint_wal",
     "maybe_export_daily", "maybe_rebalance_working_set", "message_stats",
     "nominate_node", "pending_denial_queue", "plan_working_set", "profiles",
     "propose_clues", "prune_access_log", "queue_denial_suspect", "quiet_ids",
     "rebalance_working_set", "recall", "recent_messages", "remember",
     "remember_profile", "render_brief", "schema_version", "search_messages",
     "set_memory_condition", "set_memory_status", "show_commit", "stats",
-    "status_timeline", "touch", "touch_many", "trace_to_source",
+    "status_timeline", "touch", "touch_many", "trace_to_source", "upsert_creative",
     "verify_message_chain", "wal_bytes", "working_set",
 })
 
