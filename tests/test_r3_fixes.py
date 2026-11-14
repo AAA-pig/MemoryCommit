@@ -188,3 +188,97 @@ def test_n8_fallback_exceptional_surface_skips_sinks(tmp_path):
         assert not [i for i in r["items"] if i["id"] in sinks]
     finally:
         led.close()
+
+
+# -- N9：存储层把索引当一等记忆 ------------------------------------------------
+
+def test_n9_sinks_do_not_seize_working_set(tmp_path):
+    """沉淀不抢工作记忆名额：换班方案里没有沉淀，真事实不被挤到零级。
+
+    评审复现（probe3_chain.py）：容量 3，3 条真事实 + 12 条沉淀，
+    换班后真事实 grade 全变 0，一级名额全给最新的沉淀。
+    """
+    led = L.Ledger(str(tmp_path / "a.db"))
+    try:
+        led.working_capacity = 3
+        real = [led.remember("真事实 %d" % i, importance=0.6)["memory_id"]
+                for i in range(3)]
+        for i in range(12):
+            led.remember("最近 12 条原文（用户 6 条）。开头是「闲聊 %d」" % i,
+                         level="day", tags="自动沉淀,type:auto_sink",
+                         importance=0.45)
+        sinks = led.auto_sink_ids()
+        assert len(sinks) == 12
+        plan = led.plan_working_set()
+        assert {k["id"] for k in plan["keep"]} == set(real), \
+            "工作记忆名额被沉淀占用"
+        assert not [d for d in plan["demote"] if d["id"] in real], \
+            "真事实被沉淀挤到零级"
+        res = led.rebalance_working_set(apply=True)
+        assert not res["applied"] and not res["demoted"]
+    finally:
+        led.close()
+
+
+def test_n9_sinks_do_not_count_into_flush(tmp_path):
+    """沉淀不进冲刷计划，写入沉淀也不推进普通记忆的冲刷量。
+
+    冲刷量基准取「普通记忆」里最新的 created_seq：8 条真事实之后再
+    写 12 条沉淀，m1 的 flush_amount 仍按第 8 条真事实算（8-1=7），
+    不被推进到 20-1=19。压力要够进冲刷计划（delta ≥ 4），所以用 8 条。
+    """
+    led = L.Ledger(str(tmp_path / "a.db"))
+    try:
+        real = [led.remember("真事实 %d" % i, importance=0.6)["memory_id"]
+                for i in range(8)]
+        before = {p["memory_id"]: p["flush_amount"] for p in led.flush_plan()}
+        assert before, "测试场景没造出冲刷压力，场景坏了"
+        for i in range(12):
+            led.remember("最近 12 条原文（用户 6 条）。开头是「闲聊 %d」" % i,
+                         level="day", tags="自动沉淀,type:auto_sink",
+                         importance=0.45)
+        sinks = led.auto_sink_ids()
+        plan = led.flush_plan()
+        assert not [p for p in plan if p["memory_id"] in sinks], \
+            "沉淀条目进了冲刷计划"
+        after = {p["memory_id"]: p["flush_amount"] for p in plan}
+        for mid in real:
+            assert after.get(mid) == before.get(mid), \
+                "写沉淀推进了 %s 的冲刷量（%s → %s）" % (
+                    mid, before.get(mid), after.get(mid))
+        assert after[real[0]] == 7, "冲刷量基准没有锚在普通记忆的最新序号上"
+    finally:
+        led.close()
+
+
+# -- N10：子串 LIKE 把普通记忆连到沉淀上 ----------------------------------------
+
+def test_n10_substring_tags_do_not_link_to_sinks(tmp_path):
+    """「自动」「沉淀」「auto」「sink」不再连到沉淀条目，名额不被吃掉。
+
+    评审复现（probe3_ledger.py C 段）：修复前四个标签各连出 8/8 条边，
+    而真共享「自动」标签的两条普通记忆之间反而没有边——8 个名额
+    被按存储顺序排在前面的沉淀用掉了。
+    """
+    led = L.Ledger(str(tmp_path / "a.db"))
+    try:
+        sinks = {led.remember("最近 12 条原文（用户 6 条）。开头是「闲聊 %d」" % i,
+                              level="day", tags="自动沉淀,type:auto_sink",
+                              importance=0.45)["memory_id"] for i in range(10)}
+        mids = {}
+        for tag in ("自动", "沉淀", "auto", "sink"):
+            mids[tag] = led.remember("普通记忆，标签=%s" % tag, tags=tag)["memory_id"]
+        for tag, mid in mids.items():
+            to = [x["to_id"] for x in led._query_all(
+                "SELECT to_id FROM memory_link WHERE from_id=?", (mid,))]
+            assert not (set(to) & sinks), \
+                "标签 %r 的子串命中把普通记忆连到了沉淀上" % tag
+        # 修复后行为：真共享标签的普通记忆之间照常连边，不被沉淀吃掉名额
+        a = led.remember("用户在折腾自动化脚本", tags="自动")["memory_id"]
+        b = led.remember("用户想把浇花改成自动", tags="自动")["memory_id"]
+        ab = led._query_one(
+            "SELECT 1 FROM memory_link WHERE (from_id=? AND to_id=?)"
+            " OR (from_id=? AND to_id=?)", (a, b, b, a))
+        assert ab, "真共享「自动」的普通记忆之间该有边"
+    finally:
+        led.close()

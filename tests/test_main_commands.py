@@ -574,6 +574,22 @@ def test_auto_sink_tagged_and_excluded_from_injection(mod, plugin, monkeypatch):
     assert "电视柜" in prompt
 
 
+def test_auto_sink_summary_has_no_literal_prefix(mod):
+    """N9：沉淀正文不再以字面「自动沉淀：」开头。
+
+    每条正文都以同一字面开头，「自动」「沉淀」的词面会在检索里命中
+    一切沉淀条目，把普通事实挤出词面排序；「这是什么」由 tags 里的
+    机器标记表达，正文不重复。
+    """
+    rows = [{"role": "user", "content": "空调开 26 度"},
+            {"role": "assistant", "content": "好"}]
+    text = mod.auto_sink_summary(rows)
+    assert text
+    assert not text.startswith("自动沉淀")
+    assert "关键词" in mod.auto_sink_summary(
+        [{"role": "user", "content": "空调开 26 度 空调滤网 空调遥控器"}])
+
+
 def test_auto_sink_machine_tags_produce_no_concept_edges(mod, plugin, monkeypatch):
     """N2：机器/管理标签不参与建图——沉淀条目一条 concept 边也不织。
 
