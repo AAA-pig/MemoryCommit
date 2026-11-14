@@ -47,7 +47,7 @@
 - **入公开接口清单**：`tests/test_memory_duty.py` 的 LEDGER_PUBLIC_METHODS 补这 3 个方法（契约测试同步，不是偷偷放宽）
 - `.gitignore` 补 `.coverage` / `.coverage.*` / `.temp/`（覆盖率数据与本轮临时件不入库）
 - **测试**：默认环境 **519 passed / 0 failed**（本轮基线 491：+7 回填的覆盖率补测（`tests/test_*_coverage_bridge.py`，来自上一轮桥接会话的备份回填，SHA256 与工作空间备份逐字节一致，覆盖真身 10 例里没有的 6 个场景）、+4 恢复保护用例（`test_creative.py::RestoreCreativeTest`）、+17 分支覆盖用例（`tests/test_branch_coverage_v6.py`））；变异自检——把「备份不含 creative 就不清空」的守卫去掉，`test_replace_restore_with_v3_backup_keeps_local_creative` 当场红（`0 != 2：旧备份恢复把本地创作删光了`），恢复后绿
-- **覆盖率（只认 coverage 输出，2026-11-15 实测）**：上一版记的「本机没装 coverage、装不上」是错的——`coverage 7.17.3` 装在 `C:\Users\20708\Desktop\_verify_env`（Python 3.12.15）里，只缺 pytest-cov 插件；不用装任何东西，直接 `python -m coverage run --branch --source=. -m pytest -q` 再 `python -m coverage report --include="ledger.py,main.py,conftest.py"`。口径：只统计 `ledger.py` / `main.py` / `conftest.py`，`tests/` 自身不计入，行与分支双 100%。实测行覆盖 conftest 44/44、ledger 2139/2139、main 583/583（TOTAL 2766 语句 0 缺失）；分支 1098 个里原先 21 个 partial，已逐条补测到只剩 1 个：`ledger.py` 904→912。这一处**物理不可达**——`classify_conflict` 第 1 条（场景不同 → 892 提前 return）与第 2 条（两窗不重叠 → 895 提前 return）已经先拦掉，能走到 904 的输入里 `not (scene_a and scene_b and scene_a != scene_b)` 与 `(not win_a or not win_b or _windows_overlap(...))` 两半恒为真，false 分支没有输入能触发。**没有用 `pragma: no cover` 凑数**，按约定报上去等判定；判定通过后才在这里记「哪一行、为什么排除」
+- **覆盖率（只认 coverage 输出，2026-11-15 实测）**：上一版记的「本机没装 coverage、装不上」是错的——`coverage 7.17.3` 装在某个装了 coverage 的虚拟环境（Python 3.12.15）里，只缺 pytest-cov 插件；不用装任何东西，直接 `python -m coverage run --branch --source=. -m pytest -q` 再 `python -m coverage report --include="ledger.py,main.py,conftest.py"`。口径：只统计 `ledger.py` / `main.py` / `conftest.py`，`tests/` 自身不计入，行与分支双 100%。实测行覆盖 conftest 44/44、ledger 2139/2139、main 583/583（TOTAL 2766 语句 0 缺失）；分支 1098 个里原先 21 个 partial，已逐条补测到只剩 1 个：`ledger.py` 904→912。这一处**物理不可达**——`classify_conflict` 第 1 条（场景不同 → 892 提前 return）与第 2 条（两窗不重叠 → 895 提前 return）已经先拦掉，能走到 904 的输入里 `not (scene_a and scene_b and scene_a != scene_b)` 与 `(not win_a or not win_b or _windows_overlap(...))` 两半恒为真，false 分支没有输入能触发。**没有用 `pragma: no cover` 凑数**，按约定报上去等判定；判定通过后才在这里记「哪一行、为什么排除」
 - **剩下 21 条 partial 的去向**（report -m 清单 → 现测试，逐条见 `tests/test_branch_coverage_v6.py`）：904→912 不可达（见上，v7 已用等价重构消除）；1561→1563 提交上下文里抛异常不封卷；1582→1579 `row_key` 空键名跳过；1806→1809 / 1818→1821 无 id 的行不进词表缓存；2209→2203 两条线索同强度并列只留先到的；2576→2581 闪现整句超预算就丢；2885→2884 / 2888→2887 换班计划里的过期条目不计成功；2957→2955 / 2959→2955 冲刷计划里的过期条目不计删/降；3004→2992 删除行没有快照就跳过；3039→3024 / 3044→3046 / 3047→3024 回放里认不出或改不了的脏行跳过；3223→3215 梦提案 payload 没有 memory_id；3665→3671 不带路径导出；3692→3694 表没登记排序时退化成无排序导出；4022→4019 主键为 NULL 的行算不出键就跳过；`main.py` 158→160 沉淀原文切不出关键词；782→784 访问记录没有查询词
 
 ### v7 打回返工（2026-11-15）
@@ -64,6 +64,28 @@
   - `python -m coverage report --include="ledger.py,main.py,conftest.py" --fail-under=100` → `conftest.py 44 0 6 0 100%` / `ledger.py 2138 0 892 0 100%` / `main.py 583 0 198 0 100%` / `TOTAL 2765 0 1096 0 100%`，退出码 **0**
   - `powershell -File tools\coverage_check.ps1`（`$env:PYTHON` 指向 coverage 7.17.3）→ 末尾 `[coverage_check] 行 + 分支 100%，过`，退出码 **0**
 - **`.coverage` 不进真身**：真身插件目录里发现过一个未跟踪的 `.coverage`（53248 字节，19 个源文件 / 16 个测试文件，说明有人在运行中的插件目录跑过 pytest），已删除；`.gitignore` 覆盖 `.coverage` / `.coverage.*`；**以后一律不在真身目录跑 pytest / coverage，测试只在沙盒跑**
+
+### v8 打回返工（2026-11-15）
+
+上一轮打回两条：解释器探测只抽了一半（`rollback_drill.ps1` 还写死本机路径）、conftest 混进生产覆盖率门禁。这轮收掉，并把 schema 5→6 的升级演练补齐。
+
+- **解释器探测抽成公共文件 `tools/resolve_python.ps1`**：`Test-PythonModule` / `Get-PythonCandidates` / `Resolve-PythonExe` / `Resolve-PythonExeOrThrow` 四个函数，只定义函数无副作用，供两个脚本 dot-source。候选顺序 `$env:PYTHON` → `$RepoRoot\.venv\Scripts\python.exe` → PATH 的 `python` / `python3`，逐个实地跑 `-m <模块> --version` 验证，坏的 venv（base python 已不存在）会被跳过，全失败才显式报错。`rollback_drill.ps1` 第 28 行的 `[string]$Python = "..."` 默认值删除，改为 `Resolve-PythonExeOrThrow -RequireModules @("pytest")`；`coverage_check.ps1` 删掉自己那份 `Test-CoveragePython` / `Resolve-PythonExe` 副本，改用公共函数。**演练逻辑一行未改**
+- **conftest.py 移出生产覆盖率门禁**：门禁只认 `ledger.py` / `main.py`（`--fail-under=100`），conftest 作为测试夹具单独报一次数字、不影响退出码；脚本注释与 README「覆盖率口径」都写明了为什么（它不是随插件发布的逻辑，算进总账只会让数字好看）。需要旧口径时加 `-IncludeConftest`
+- **CHANGELOG 脱敏**：删掉残留的本机绝对路径，改为「某个装了 coverage 的虚拟环境」
+- **schema 5→6 升级演练（副本上做，真库零写入）**：三件套（`.db` + `-wal` + `-shm`）一起拷；在 02:54 的 v5 备份（schema 5、17 表、无 creative）上跑 `Ledger()` 打开：schema 5→6，`creative` 与 `idx_creative_seq` 建出，memory 576 / clue 1134 / message 898 / access_log 1932 / memory_clue 3468 逐表不变，`integrity_check=ok`，二次打开完全幂等（不再迁移、不建提交）。`_migrate_auto_sink_legacy` **会**额外建 1 个提交（C95→C96）：36 条旧沉淀补 `type:auto_sink`、摘 252 条机器标签边（`memory_link` 15142→14890）。方案与回滚条件见 `docs/升级-schema5-to-6-方案.md`
+- **实测**：`tools/coverage_check.ps1` → `524 passed`，`ledger.py 2138/2138 + main.py 583/583`（分支 892+198）双 100%，退出码 0；conftest 单列 44/44、6/6。`tools/rollback_drill.ps1` 实跑：场景 A 红（failed=19，报警器有效）；场景 B 红（failed=3）——**这是脚本 B 场景的已知盲点，不是回滚点坏了**：B 只按 `git ls-tree` 名单删掉新增测试文件、不还原名单内文件的旧内容，`tests/test_ledger.py` / `test_memory_duty.py` 留着 HEAD 的新断言（`test_schema_is_v5` 等）去跑 v5 代码，必然红。上轮 B 绿是因为当时这两个文件还没被 `1149e3b` 改过
+
+### v9 打回返工（2026-11-15）
+
+上一轮打回四条 + 一条小尾巴：改动没提交（只有工作区，与「必须已提交、与真身逐字节一致」的口径不符）、升级文档只是嘴上说写了（`docs/` 里查不到）、文档缺一条排障警示、数据口径要拿实测补齐、CHANGELOG 里残留本机绝对路径。
+
+- **落库**：本轮改动（`tools/resolve_python.ps1` 新增、`tools/coverage_check.ps1` / `tools/rollback_drill.ps1` / `README.md` / `CHANGELOG.md` 修改、`docs/升级-schema5-to-6-方案.md` 新增）一次性提交并 push 到 `origin/main`，真身 `git pull --ff-only` 到同一提交；两侧 `git rev-parse HEAD` 相等、`git status` 都干净，`ledger.py` / `main.py` / `conftest.py` / `tools` 下四个 `.ps1` 的 SHA256 双证一致。作者按「已提交」口径向上一级回传，不再留未跟踪文件
+- **升级文档真有**：`docs/升级-schema5-to-6-方案.md`（约 280 行）。含三件套备份的确切命令、副本预演逐表行数对照表、卸载 → 重载 → 验证七步与逐条判定阈值表、回滚触发条件与已知代价、以及第 0 节的排障警示
+- **新增排障警示（第 0 节）**：只读探真库必须 `file:...?mode=ro`，**不能加 `immutable=1`**——加了会跳过 WAL，读到 checkpoint 之前的旧快照，表现是「迁移明明跑了，看着像没跑」。同一份三件套副本上实测对照：`mode=ro` → schema 6 / C101 / 18 表 / creative 存在 / message 932 / access_log 1983 / memory_link 14890；`mode=ro&immutable=1` → schema 5 / C99 / 17 表 / 无 creative / message 928 / access_log 1977 / memory_link 15166。上一轮「真库还是 schema 5」的误判就是这条参数造成的
+- **数据口径补上取数时刻**：`message 930` / `access_log 1980` 是 **04:14:53** 那份三件套副本的读数（`-wal` 383192 字节，探针 04:22:46 跑完），不是「现在的读数」。04:31:05 复测同一真库：`message 932` / `access_log 1983`，其余逐表一分不差——只增表在 WAL 里继续涨是正常现象，不是数据异常。文档第 1 节把两次读数并排列出
+- **`memory_link` 少 7 条：给出可复现命令与两组数字**（不再只说「一模一样」）。A 组真库副本：当前 14890 / 重放 14897 / 差 −7 / 缺失 7 条 / 多出 0 / 内容不同 0；B 组对照组（打开前把 `_migrate_auto_sink_legacy` 换成空实现，同一份 v5 备份）：当前 15142 / 重放 15149 / 差 −7 / 缺失同样的 7 条 / 多出 0 / 内容不同 0。7 条为 `m3|m1|记忆账本`、`m3|m2|记忆账本`、`m4|m3|方向`、`m4|m3|老大交代`、`m4|m3|脱离AstrBot`、`m5|m3|脱离AstrBot`、`m5|m4|脱离AstrBot`；查 `commit_row` 确认它们分别由 C8 / C10 / C14 `insert`、**链里没有任何 delete 记录**，属早期绕过提交链删库留下的历史欠账。脚本 `drill_link_diff.py` / `drill_link_trace.py` 已落在演练目录，可复跑
+- **脱敏**：`CHANGELOG.md` 里最后一处本机绝对路径删掉（改为「某个装了 coverage 的虚拟环境」）；`docs/升级-schema5-to-6-方案.md` 里的数据目录改成 `%USERPROFILE%\.local\share\jingjing-memory`，不再写死用户名
+- **实测**：`524 passed / 0 failed`；`tools/coverage_check.ps1` → `ledger.py 2138/2138 + main.py 583/583`（分支 892+198）双 100%，conftest 单列 44/44、6/6，退出码 0
 
 ### 测试
 

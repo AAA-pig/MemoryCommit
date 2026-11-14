@@ -25,7 +25,7 @@ param(
     [string]$RepoRoot,
     [string]$BackupDir,
     [string]$RollbackTarget = "8677e13",
-    [string]$Python = "C:\Users\20708\Desktop\_verify_env\Scripts\python.exe",
+    [string]$Python,
     [string]$OutDir,
     [switch]$DryRun,
     [switch]$KeepWork
@@ -36,6 +36,14 @@ $ErrorActionPreference = "Stop"
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
 if (-not $BackupDir) { $BackupDir = Join-Path $RepoRoot ("backups\2026-11-14-" + $RollbackTarget) }
 if (-not $OutDir) { $OutDir = Join-Path $RepoRoot "tools\drill_out" }
+
+# 解释器探测与 coverage_check.ps1 共用同一份实现，本脚本不再硬编码路径
+. (Join-Path $PSScriptRoot "resolve_python.ps1")
+if ([string]::IsNullOrWhiteSpace($Python)) {
+    $Python = Resolve-PythonExeOrThrow -RequireModules @("pytest") -RepoRoot $RepoRoot -Hint "用 -Python 指定解释器路径。"
+} elseif (-not (Test-PythonModule -Exe $Python -Module "pytest")) {
+    throw "指定的 python 跑不了 -m pytest --version：$Python"
+}
 
 $CodeFiles = @("ledger.py", "main.py", "conftest.py", "pyproject.toml", "metadata.yaml")
 
@@ -141,6 +149,7 @@ function Restore-TestsToTarget($work) {
 # 0. 前置检查（一律显式失败，不静默降级）
 # --------------------------------------------------------------------------
 if (-not (Test-Path $Python)) { throw "测试解释器不存在：$Python" }
+$Python = (Resolve-Path -LiteralPath $Python).Path
 if (-not (Test-Path $BackupDir)) { throw "备份目录不存在：$BackupDir" }
 foreach ($f in $CodeFiles) {
     if (-not (Test-Path (Join-Path $BackupDir $f))) { throw "备份缺文件：$(Join-Path $BackupDir $f)" }
