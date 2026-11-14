@@ -143,7 +143,10 @@ def auto_sink_summary(rows) -> str:
         if len(keywords) >= 5:
             break
     head = said if len(said) <= 60 else said[:60] + "…"
-    text = "自动沉淀：最近 %d 条原文（用户 %d 条）。开头是「%s」" % (
+    # 正文不再带字面前缀「自动沉淀：」（N9）：「这是什么」已由 tags 里的
+    # 机器标记表达，正文重复一次只会让「自动」「沉淀」这些词面在检索里
+    # 命中一切沉淀条目，把普通事实挤出词面排序。
+    text = "最近 %d 条原文（用户 %d 条）。开头是「%s」" % (
         len(rows), sum(1 for r in rows if r.get("role") == "user"), head)
     if keywords:
         text += "；关键词：" + "、".join(keywords)

@@ -1340,17 +1340,26 @@ class CommitBuilder:
 
         N2：机器/管理标签（type: 前缀类型标记、「自动沉淀」统一标签）不是
         语义概念，在这里拦下不许当 concept——见 is_machine_tag。识别和
-        检索仍走 tags（auto_sink_ids / recall），只有建图这一条路收紧。
+        检索仍走 tags（auto_sink_ids / recall）。
+        N10：候选邻居改精确判定——子串 LIKE 只用来缩小扫描范围，命中后
+        按逗号分隔的完整标签集合确认 tag 确实在其中，且目标条目自身
+        不带机器标签；否则「自动」「沉淀」这类普通标签的子串命中会把
+        普通记忆连到沉淀上，还吃掉名额。ORDER BY created_seq DESC 让
+        候选顺序确定（新写的先连），凑够 8 条即停。
         存量库里已织出的这类边由打开库时的 _migrate_auto_sink_legacy()
         摘除（N6）。
         """
         for tag in tag_list:
             if is_machine_tag(tag):
                 continue
-            hits = self.ledger._query_all(
-                "SELECT id FROM memory WHERE id != ? AND tags LIKE ? LIMIT 8",
-                (mid, "%" + tag + "%"))
-            for h in hits:
+            linked = 0
+            for h in self.ledger._query_all(
+                    "SELECT id, tags FROM memory WHERE id != ? AND tags LIKE ?"
+                    " ORDER BY created_seq DESC LIMIT 32",
+                    (mid, "%" + tag + "%")):
+                tags = {t.strip() for t in (h["tags"] or "").split(",")}
+                if tag not in tags or any(is_machine_tag(t) for t in tags):
+                    continue
                 nid = h["id"]
                 if self.ledger._query_one(
                         "SELECT 1 FROM memory_link WHERE (from_id=? AND to_id=?)"
@@ -1360,6 +1369,9 @@ class CommitBuilder:
                            {"from_id": mid, "to_id": nid, "concept": tag}, None,
                            {"from_id": mid, "to_id": nid, "concept": tag,
                             "strength": 1.0, "created_at": now_str()})
+                linked += 1
+                if linked >= 8:
+                    break
 
     # touch 已经搬到 Ledger.touch_many：记住「被想起过」不是一次记忆编辑，
     # 不该在提交链上留页。这里故意不留兼容壳，免得以后有人又顺着它写回提交。
@@ -2710,11 +2722,16 @@ class Ledger:
         现有的一级和「最近又被反复想起」的零级放在同一张榜上排名，
         一起抢 capacity 个名额。一次算清，就不存在先降后升、下轮又降的来回打。
         二级是巩固层，压根不参加这场竞争。
+        N9：沉淀条目是原文索引不是普通事实，不参加这场竞争——否则它
+        按 importance=0.45 的普通身段抢座，把真事实挤到零级，冲刷时
+        再被标成 delete，一路连错。
         """
         cap = self.working_capacity if capacity is None else int(capacity)
         now_seq = self.max_created_seq()
         hits = self._recent_hits() if cap > 0 else {}
+        sink_ids = self.auto_sink_ids()
         rows = [dict(r) for r in self._query_all("SELECT * FROM memory")]
+        rows = [r for r in rows if r["id"] not in sink_ids]
         for r in rows:
             r["activation"] = round(working_activation(r, now_seq,
                                                        hits.get(r["id"], 0)), 4)
@@ -2797,10 +2814,18 @@ class Ledger:
     # -- 冲刷 --
 
     def flush_plan(self) -> List[Dict[str, Any]]:
-        now_seq = self.max_created_seq()
+        sink_ids = self.auto_sink_ids()
+        rows = [dict(r) for r in self._query_all("SELECT * FROM memory ORDER BY created_seq")]
+        # 冲刷量的基准序号取「普通记忆」里最新的 created_seq（N9）：
+        # 沉淀条目是索引不是事实，它写入推进的序号不该变成真事实的冲刷
+        # 压力——否则每写一条沉淀，所有普通记忆的冲刷量同步涨一格。
+        now_seq = max((int(r["created_seq"]) for r in rows
+                       if r["id"] not in sink_ids), default=0)
         plan = []
-        for r in self._query_all("SELECT * FROM memory ORDER BY created_seq"):
-            r = dict(r)
+        for r in rows:
+            if r["id"] in sink_ids:
+                # 沉淀是索引不是普通事实：不进冲刷计划、不参与计量（N9）
+                continue
             # 长期主题 / 高重要性记忆钉住，不参与自动冲刷
             if r["level"] == "topic" or float(r["importance"]) >= 0.85:
                 continue
