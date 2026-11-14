@@ -109,6 +109,12 @@ AUTO_SINK_TYPE_TAG = "type:auto_sink"
 # type:auto_sink；recall 搜「自动沉淀」靠 tags 命中），不是为了当概念。
 AUTO_SINK_LABEL = "自动沉淀"
 
+# 自动沉淀的完整机器标记集合（N6）：识别口径与建图口径（is_machine_tag）
+# 同源——tags 里带其中任一个完整标签就算沉淀。1.5.0 期间写出的存量
+# 条目只有「自动沉淀」标签，靠这里兜住；打开旧库时另有
+# _migrate_auto_sink_legacy() 补上类型标记。
+AUTO_SINK_MARKERS = frozenset({AUTO_SINK_TYPE_TAG, AUTO_SINK_LABEL})
+
 
 def is_machine_tag(tag: str) -> bool:
     """机器/管理标签判定（N2）：type: 前缀的类型标记，或自动沉淀的统一标签。
@@ -1335,8 +1341,8 @@ class CommitBuilder:
         N2：机器/管理标签（type: 前缀类型标记、「自动沉淀」统一标签）不是
         语义概念，在这里拦下不许当 concept——见 is_machine_tag。识别和
         检索仍走 tags（auto_sink_ids / recall），只有建图这一条路收紧。
-        存量库里已织出的这类边不自动回收：默认关后新库不会再产生，注入
-        侧另有 auto_sink 排除兜着，不影响提示词。
+        存量库里已织出的这类边由打开库时的 _migrate_auto_sink_legacy()
+        摘除（N6）。
         """
         for tag in tag_list:
             if is_machine_tag(tag):
@@ -1370,6 +1376,36 @@ class CommitBuilder:
         after["updated_at"] = now_str()
         self._push("memory", "update", {"id": memory_id}, {"grade": snap["grade"]}, after)
         return True
+
+    def retype_memory(self, memory_id: str, new_tags: str) -> bool:
+        """改一条记忆的 tags（N6 存量迁移用，走正常 update 行）。
+
+        迁移只能走提交链（写入必须发生在提交里），所以暴露成 builder
+        方法而不是 Ledger 上的裸 SQL。
+        """
+        snap = self._find_memory(memory_id)
+        if snap is None:
+            return False
+        if (snap.get("tags") or "") == (new_tags or ""):
+            return False
+        after = dict(snap)
+        after["tags"] = new_tags
+        after["updated_at"] = now_str()
+        self._push("memory", "update", {"id": memory_id},
+                   {"tags": snap.get("tags") or ""}, after)
+        return True
+
+    def unlink_edge(self, link: Dict[str, Any]) -> None:
+        """按行的完整身份（from|to|concept）删一条 concept 边（N6 迁移用）。
+
+        删除行的 row_key 与 before 都带完整字段，重放时认得出删的是哪条（R4）。
+        """
+        self._push("memory_link", "delete",
+                   {"from_id": link["from_id"], "to_id": link["to_id"],
+                    "concept": link["concept"]},
+                   {"id": link["id"], "from_id": link["from_id"],
+                    "to_id": link["to_id"], "concept": link["concept"],
+                    "strength": link["strength"]}, None)
 
     def forget(self, memory_id: str) -> bool:
         snap = self._find_memory(memory_id)
@@ -1496,6 +1532,9 @@ class Ledger:
                 cx.execute("INSERT OR IGNORE INTO meta(k, v) VALUES(?, ?)", (k, v))
         # 建表之后马上对版本：老库没有这个键，会被当成 0 号往上迁
         self._migrate()
+        # 结构迁移走完，再补一次存量沉淀的数据迁移（N6）：也走提交链，
+        # 先查后写，没有存量就一个提交都不动，重复执行不出错。
+        self._migrate_auto_sink_legacy()
 
     def schema_version(self) -> int:
         """库里的结构版本。老库没有这个键时返回 0，不假装它是最新的。"""
@@ -1527,6 +1566,40 @@ class Ledger:
                 step(self, cx)
                 self._set_meta(cx, "schema_version", cur + 1)
             applied.append(cur + 1)
+
+    def _migrate_auto_sink_legacy(self) -> Dict[str, int]:
+        """N6 存量迁移：给旧格式沉淀补类型标记、摘掉机器标签边。
+
+        1.5.0 期间（468731f..954ef20）的 _auto_sink 只写统一标签
+        「自动沉淀」，没有 type:auto_sink 类型标记；旧版 _auto_link
+        还把它们当语义概念织了边。打开旧库时在这里补齐，口径与
+        is_machine_tag / auto_sink_ids() 同源。
+
+        必须走提交链（写入只能发生在提交里），回放与自检才对得上；
+        先查后写，没有存量就一个提交都不建——重复执行不出错。
+        只动 tags 与 memory_link，正文与访问痕迹一概不碰。
+        """
+        legacy: List[Dict[str, str]] = []
+        for r in self._query_all(
+                "SELECT id, tags FROM memory WHERE tags LIKE ?",
+                ("%" + AUTO_SINK_LABEL + "%",)):
+            tags = {t.strip() for t in (r["tags"] or "").split(",")}
+            if AUTO_SINK_LABEL in tags and AUTO_SINK_TYPE_TAG not in tags:
+                legacy.append({"id": r["id"],
+                               "tags": "%s,%s" % (r["tags"], AUTO_SINK_TYPE_TAG)})
+        edges = [dict(e) for e in self._query_all(
+            "SELECT id, from_id, to_id, concept, strength FROM memory_link"
+            " WHERE concept LIKE 'type:%' OR concept = ?", (AUTO_SINK_LABEL,))]
+        edges = [e for e in edges if is_machine_tag(e["concept"])]
+        if not legacy and not edges:
+            return {"retyped": 0, "unlinked": 0}
+        with self.commit("存量沉淀迁移：补类型标记 %d 条，摘机器标签边 %d 条"
+                         % (len(legacy), len(edges))) as c:
+            for item in legacy:
+                c.retype_memory(item["id"], item["tags"])
+            for e in edges:
+                c.unlink_edge(e)
+        return {"retyped": len(legacy), "unlinked": len(edges)}
 
 
     @contextmanager
@@ -1876,13 +1949,20 @@ class Ledger:
     def recall(self, query: str = "", limit: int = 5, scope_key: str = "",
                touch: bool = True, expand: bool = True,
                half_life_days: float = HALF_LIFE_DAYS,
-               min_score: float = 0.15) -> List[Dict[str, Any]]:
+               min_score: float = 0.15,
+               exclude: Optional[set] = None) -> List[Dict[str, Any]]:
+        """显式检索。exclude（N7）：调用方要求从候选里剔除的记忆集合，
+        在排序与截断之前生效——被排除的条目既不占 limit 名额，也不会
+        当作图谱扩散的种子。不传就什么都不剔（显式检索仍找得到沉淀）。
+        """
         sql = "SELECT * FROM memory"
         params: Tuple[Any, ...] = ()
         if scope_key:
             sql += " WHERE scope_key = ? OR scope_key = ''"
             params = (scope_key,)
         rows = [dict(r) for r in self._query_all(sql, params)]
+        if exclude:
+            rows = [r for r in rows if r["id"] not in exclude]
         if not rows:
             return []
 
@@ -2039,13 +2119,15 @@ class Ledger:
             r["clues"] = clue_map.get(r["id"], [])
 
     def _clue_bridge(self, query: str, limit: int = 6,
-                     scope_key: str = "") -> List[Dict[str, Any]]:
+                     scope_key: str = "",
+                     exclude: Optional[set] = None) -> List[Dict[str, Any]]:
         """一个词先撞上「线索」，线索再把挂着它的记忆牵出来。
 
         ai-memory 里联想的主路走的是线索，不是记忆连记忆：
         查询 → 线索 → 记忆。稀有线索权重高，所以「空调」能牵出具体的事，
         而「日常」这种满地都是的线索牵不动什么。
         scope_key 非空时，牵出的记忆限制在该会话（或全局共享 scope_key=''）。
+        exclude（N7）：排序截断之前剔除的候选集合。
         """
         q_tokens = set(tokenize(query))
         if not q_tokens:
@@ -2075,7 +2157,7 @@ class Ledger:
         seen = set()
         for clue, strength, row in scored[:max(1, limit)]:
             for mid in link_map.get(row["clue_id"], []):
-                if mid in seen:
+                if mid in seen or (exclude and mid in exclude):
                     continue
                 mem = self._query_one("SELECT * FROM memory WHERE id = ?", (mid,))
                 if not mem:
@@ -2097,12 +2179,16 @@ class Ledger:
 
     def _fresh_candidates(self, limit: int = 12,
                           scope_key: str = "",
-                          context: Optional[dict] = None) -> List[Dict[str, Any]]:
+                          context: Optional[dict] = None,
+                          exclude: Optional[set] = None) -> List[Dict[str, Any]]:
         """没人问起时，哪些记忆有资格自己冒出来：新鲜 × 重要 × 巩固。
 
         v5 职守过滤：disputed（被否认，停止主动提起）不进主动浮现池；
         coexist（条件并存）给语境且条件匹配才进（R3），判不出/不匹配不进；
         显式检索（recall）仍找得到。
+        N7：exclude 是「不许进候选池」的集合，在排序截断之前过滤——
+        候选池截断发生在调用方（activate），先截后排会让被排除的条目
+        把真事实挤出名单。
         """
         sql = "SELECT * FROM memory"
         params: Tuple[Any, ...] = ()
@@ -2110,6 +2196,8 @@ class Ledger:
             sql += " WHERE scope_key = ? OR scope_key = ''"
             params = (scope_key,)
         quiet = self.quiet_ids(context)
+        if exclude:
+            quiet = quiet | set(exclude)
         out: List[Dict[str, Any]] = []
         for row in self._query_all(sql, params):
             r = dict(row)
@@ -2162,6 +2250,10 @@ class Ledger:
         # 都不许当普通事实进系统提示，五条路线一起拦。
         quiet = self.quiet_ids(context)
         auto_sink = self.auto_sink_ids()
+        # N7：hidden 在这里定死，往下传给每条路线的候选池——排除发生在
+        # 排序截断之前，沉淀才不会把真事实挤出检索名单。take() 里那道
+        # 检查保留作双保险，不再是唯一的一道。
+        hidden = quiet | auto_sink
 
         def take(rows: Iterable[Dict[str, Any]], route: str,
                  cap: Optional[int] = None, force: bool = False) -> bool:
@@ -2187,14 +2279,15 @@ class Ledger:
 
         if query:
             hits = [h for h in self.recall(query, limit=max(slots * 3, 6),
-                                           scope_key=scope_key, touch=False)
+                                           scope_key=scope_key, touch=False,
+                                           exclude=hidden)
                     if h.get("bm25", 0) > 0 or str(h.get("match", "")).startswith("clue:")]
             take(hits, "search")
 
         # 线索桥：一个词先撞上线索，再顺着线索牵出记忆（scope 贯穿，R6）
         flashes: List[str] = []
         if query and len(picked) < slots:
-            for cand in self._clue_bridge(query, slots * 3, scope_key):
+            for cand in self._clue_bridge(query, slots * 3, scope_key, exclude=hidden):
                 if len(picked) >= slots:
                     break
                 before = len(picked)
@@ -2248,7 +2341,8 @@ class Ledger:
         # 不会把 420 预算塞满），route 单独标 fallback，让注入日志能区分「正常激活」
         # 和「检索落空后的兜底」，绝不伪装成 search/activate。冷却照常生效。
         if not query and len(picked) < slots:
-            take(self._fresh_candidates(slots * 4, scope_key, context), "activate")
+            take(self._fresh_candidates(slots * 4, scope_key, context,
+                                        exclude=hidden), "activate")
         elif query and not picked:
             # 进兜底分支就无条件记一条 route：让注入日志分得清「没走兜底」和
             # 「兜底被冷却挡光」，别再拿 route=none 顶替、搞得 17 行 no_hit
@@ -2258,13 +2352,18 @@ class Ledger:
             # 第一名 m6 刚进冷却就直接 route=none、items=[]，而 m2/m1/m5/m7
             # 明明还能用。池子给大（slots*3，至少 6），让不在冷却的候选能进来；
             # 但真正注入的仍只取 slots//2 条，保住 420 预算不被塞满。
-            candidates = self._fresh_candidates(max(slots * 3, 6), scope_key, context)
+            candidates = self._fresh_candidates(max(slots * 3, 6), scope_key, context,
+                                                exclude=hidden)
             took = take(candidates, "fallback", cap=max(1, slots // 2))
-            if not took and len(candidates) >= 2:
-                # 候选全在冷却里（还不止一条）：允许取「最久没露面」的 1 条
-                # 破例浮现，仍标 fallback，避免检索落空后整轮空转。
-                last = min(candidates, key=lambda r: self._surfaced.get(r["id"], 0.0))
-                took = take([last], "fallback", cap=1, force=True)
+            if not took:
+                # 候选全在冷却里：允许取「最久没露面」的 1 条破例浮现，仍标
+                # fallback，避免检索落空后整轮空转。hidden 已在候选池外，
+                # 这里再剔一道是双保险（N8）：沉淀永远不会被注入、_surfaced
+                # 恒为 0，不做这一步它会永久霸占破例名额，整轮 fallback_blocked。
+                eligible = [c for c in candidates if c["id"] not in hidden]
+                if len(eligible) >= 2:
+                    last = min(eligible, key=lambda r: self._surfaced.get(r["id"], 0.0))
+                    took = take([last], "fallback", cap=1, force=True)
             if not took:
                 # 兜底真被挡光（单条候选且它在冷却 / 候选池是空的）：单独标
                 # fallback_blocked，和「根本没进兜底」区分开。
@@ -2947,20 +3046,21 @@ class Ledger:
         return {m for m, s in self._latest_status_map().items() if s == "disputed"}
 
     def auto_sink_ids(self) -> set:
-        """带自动沉淀类型标记（AUTO_SINK_TYPE_TAG）的记忆集合（N1）。
+        """带自动沉淀机器标记的记忆集合（N1/N6）。
 
-        这些条目是原文索引不是普通事实：唤起（activate）的五条路线
-        （search / associate / graph / activate / fallback）一律不收，
-        只留给显式检索（recall / search_messages）找。
+        识别口径与建图（is_machine_tag）同源：tags 里有完整标签
+        type:auto_sink 或「自动沉淀」任一个就算沉淀。1.5.0 期间
+        （468731f..954ef20）写出的存量条目只有「自动沉淀」标签，
+        不能指望每条都补过迁移，两个标记都得认。
         SQL 先按子串缩小范围，Python 再按逗号分隔的完整标签精确判定，
         不靠 LIKE 子串猜，免得「type:auto_sink_x」这类前缀撞车。
         """
         out: set = set()
         for r in self._query_all(
-                "SELECT id, tags FROM memory WHERE tags LIKE ?",
-                ("%" + AUTO_SINK_TYPE_TAG + "%",)):
+                "SELECT id, tags FROM memory WHERE tags LIKE ? OR tags LIKE ?",
+                ("%" + AUTO_SINK_TYPE_TAG + "%", "%" + AUTO_SINK_LABEL + "%")):
             tags = {t.strip() for t in (r["tags"] or "").split(",")}
-            if AUTO_SINK_TYPE_TAG in tags:
+            if tags & AUTO_SINK_MARKERS:
                 out.add(r["id"])
         return out
 
