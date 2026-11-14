@@ -21,3 +21,8 @@ venv/
 *.log
 .DS_Store
 *.bak-*
+
+# 回滚兜底副本：本地快照，不是源码（说明见 backups/2026-11-14-1.5.1 上线版/MANIFEST.md，同样不入库）
+backups/
+# 回滚演练产物（每次实跑都会重写）
+tools/drill_out/
