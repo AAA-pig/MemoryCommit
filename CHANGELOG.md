@@ -2,12 +2,14 @@
 
 ## 1.6.0 — 2026-11-14
 
-按外部审查报告（《MemoryCommit 项目代码审查与改进方案》2026-11-14）做的可靠性加固轮：备份完整性、有损导入、安全表述、持久性档位、时间契约。
+按外部审查报告（《MemoryCommit 项目代码审查与改进方案》2026-11-14）做的可靠性加固轮：备份完整性、有损导入、安全表述、持久性档位、时间契约。2026-11-15 追加 v6 创作项目旁路表（同为本版内容，见下方 v6 段）。
 
-### 破坏性变更（升级前先读这两条）
+### 破坏性变更（升级前先读这几条）
 
 - **备份格式 v3（DUMP_VERSION 2→3）**：access_log 纳入 JSONL 备份。旧版本代码（只认 v2）读到 v3 备份会在文件头拒收（「备份格式 v3 比当前支持的 v2 新」）——先升级代码再导入；反过来 v2 及更早的老备份在新代码里照常导入，只是里面本来就没有访问明细
 - **有损导入默认拒绝**：备份里带当前库不存在的列时，load_jsonl 默认抛错（报错列出 表.列，原库一字节不动）；确认接受降级导入须显式传 allow_lossy=True，行为同旧版（照灌并在结果里报告丢列）
+- **备份格式 v4（DUMP_VERSION 3→4，2026-11-15）**：creative 表纳入 JSONL 备份。旧代码（只认 v3）读到 v4 备份会在文件头拒收（「备份格式 v4 比当前支持的 v3 新」）——先升级代码再导入；反过来 v3 及更早的老备份在新代码里照收，只是里面本来就没有创作项目
+- **替换式恢复不再清空本地创作（2026-11-15）**：`load_jsonl(..., replace=True)` 过去按 DUMP_TABLES 逐表 `DELETE`，而 creative 已进 DUMP_TABLES——拿一份不含 creative 的旧备份做替换式恢复，会把本地所有创作项目（正文，提交链里重放不出来）静默删光。现在清空只清「备份真的带来」的表：备份不含 creative 就原样保留本地创作，并在 `warnings` 里报「备份不含 creative 表（结构 vN），本地 M 条创作已保留」；备份带 creative（结构 v6 / 格式 v4）才照常整体替换。结构版本 < 6 或文件头 tables 无 creative 时，`warnings` 一律给提示
 
 ### P0-1 备份补 access_log
 
@@ -36,11 +38,40 @@
 - now_str / _parse_time_cached / _parse_time 补契约 docstring：账本时间是本地时间、无时区偏移，解析按运行机器本地时区（mktime 语义）；跨时区搬库后时间差、每日导出日期、访问窗口可能偏移
 - 统一 UTC 要牵动存量数据的解释（迁移级改动），本轮只写契约不迁移；新增测试固定这个已知限制，哪天改 UTC 这条测试就是第一个要改写的见证
 
+### v6 创作项目旁路表（creative，2026-11-15 追加）
+
+- **SCHEMA_VERSION 5→6**：新增旁路表 `creative`（id 主键 / title / work_type / status / premise / outline / body / payload / current_chars / target_chars / created_at / updated_at / created_seq）+ 索引 `idx_creative_seq`。纯加法：`_migrate_5_to_6` 走 `CREATE TABLE IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`，重复执行不出错，也不改任何存量表
+- **DUMP_VERSION 3→4 / DUMP_TABLES 加 creative**：创作正文与原始档必须跟着搬家，否则「整本原样搬家」又成谎报；`_DUMP_ORDER` 给 `created_at, id` 稳定排序
+- **三个公开方法**：`upsert_creative`（唯一写口：同 id 覆盖但保留 created_at / created_seq）、`get_creative`（按 id 读正文与 payload）、`list_creatives`（只带 id/title/work_type/status/current_chars 轻量字段）。边界写死：旁路表直写事务，**不进提交链、不碰 memory 表与任何检索打分**（创作不是记忆内容的变更，是另一条业务线的归档）
+- **替换式恢复的创作保护**：见上方「破坏性变更」第三条——备份不含 creative 时保留本地创作并报数，另补测试（构造结构 v3 备份 + 本地有创作，断言行数与 warnings 文案）
+- **入公开接口清单**：`tests/test_memory_duty.py` 的 LEDGER_PUBLIC_METHODS 补这 3 个方法（契约测试同步，不是偷偷放宽）
+- `.gitignore` 补 `.coverage` / `.coverage.*` / `.temp/`（覆盖率数据与本轮临时件不入库）
+- **测试**：默认环境 **519 passed / 0 failed**（本轮基线 491：+7 回填的覆盖率补测（`tests/test_*_coverage_bridge.py`，来自上一轮桥接会话的备份回填，SHA256 与工作空间备份逐字节一致，覆盖真身 10 例里没有的 6 个场景）、+4 恢复保护用例（`test_creative.py::RestoreCreativeTest`）、+17 分支覆盖用例（`tests/test_branch_coverage_v6.py`））；变异自检——把「备份不含 creative 就不清空」的守卫去掉，`test_replace_restore_with_v3_backup_keeps_local_creative` 当场红（`0 != 2：旧备份恢复把本地创作删光了`），恢复后绿
+- **覆盖率（只认 coverage 输出，2026-11-15 实测）**：上一版记的「本机没装 coverage、装不上」是错的——`coverage 7.17.3` 装在 `<本地虚拟环境>`（Python 3.12.15）里，只缺 pytest-cov 插件；不用装任何东西，直接 `python -m coverage run --branch --source=. -m pytest -q` 再 `python -m coverage report --include="ledger.py,main.py,conftest.py"`。口径：只统计 `ledger.py` / `main.py` / `conftest.py`，`tests/` 自身不计入，行与分支双 100%。实测行覆盖 conftest 44/44、ledger 2139/2139、main 583/583（TOTAL 2766 语句 0 缺失）；分支 1098 个里原先 21 个 partial，已逐条补测到只剩 1 个：`ledger.py` 904→912。这一处**物理不可达**——`classify_conflict` 第 1 条（场景不同 → 892 提前 return）与第 2 条（两窗不重叠 → 895 提前 return）已经先拦掉，能走到 904 的输入里 `not (scene_a and scene_b and scene_a != scene_b)` 与 `(not win_a or not win_b or _windows_overlap(...))` 两半恒为真，false 分支没有输入能触发。**没有用 `pragma: no cover` 凑数**，按约定报上去等判定；判定通过后才在这里记「哪一行、为什么排除」
+- **剩下 21 条 partial 的去向**（report -m 清单 → 现测试，逐条见 `tests/test_branch_coverage_v6.py`）：904→912 不可达（见上，v7 已用等价重构消除）；1561→1563 提交上下文里抛异常不封卷；1582→1579 `row_key` 空键名跳过；1806→1809 / 1818→1821 无 id 的行不进词表缓存；2209→2203 两条线索同强度并列只留先到的；2576→2581 闪现整句超预算就丢；2885→2884 / 2888→2887 换班计划里的过期条目不计成功；2957→2955 / 2959→2955 冲刷计划里的过期条目不计删/降；3004→2992 删除行没有快照就跳过；3039→3024 / 3044→3046 / 3047→3024 回放里认不出或改不了的脏行跳过；3223→3215 梦提案 payload 没有 memory_id；3665→3671 不带路径导出；3692→3694 表没登记排序时退化成无排序导出；4022→4019 主键为 NULL 的行算不出键就跳过；`main.py` 158→160 沉淀原文切不出关键词；782→784 访问记录没有查询词
+
+### v7 打回返工（2026-11-15）
+
+上一版报的「904→912 分支物理不可达，等判定」被驳回了：**不批 pragma，要等价重构**。这轮就是这么改的。
+
+- **classify_conflict 死分支消除（等价重构，不是遮盖）**：删掉第 4 段原来的 `if not (scene_a and scene_b and scene_a != scene_b) and (not win_a or not win_b or _windows_overlap(...)):` 两行条件（原 904–905），把 env 比较与 `_mutex_hit` 的 body 平铺到同一层，注释写明「能走到这里，前提是 892/895 两处提前返回仍在」。行数 2139→2138、分支 894→892 是**删掉死代码**的自然结果，测试与语义一行没变
+- **等价性证明（可复跑）**：把 HEAD 版 `ledger.py` 与新工作区版同时加载，对 `classify_conflict` 跑 414720 组组合（场景 × 时间窗 × 环境 × 视角 × 摘要对，含空条件、空串、坏日期），**逐组返回值比对 0 差异**，五类返回值命中数：scene 51840 / temporal 181440 / perspective 68040 / true_mutex 15120 / undetermined 98280
+- **新增 `tests/test_classify_conflict_guards.py`（5 例）**：把重构依赖的前提钉死——场景不同 + 词面互斥仍是 scene_dependent、时间窗不重叠 + 词面互斥仍是 temporal、时间窗重叠或无窗时 true_mutex 照旧可达、时间窗重叠但 env 不同仍是 undetermined（env 那道闸没被顺手删掉）
+- **`tests/test_creative.py` 入库（15 例，此前一直是未跟踪 ??）**：11 个创作表用例 + 4 个替换式恢复保护用例；顺手修了一处路径大小写——文件里写的是 `Ledger.py`，Windows 上碰巧能打开，Linux/大小写敏感文件系统直接 FileNotFoundError，改成 `ledger.py`
+- **`tools/coverage_check.ps1` 去掉写死的本机解释器路径**：依次探测 `$env:PYTHON` → PATH 里的 `python` → `python3`，每个都用 `-m coverage --version` 实地验证（返回码 0 且输出含 `Coverage.py`），第一个能跑的才用；全失败给出明确报错并提示 `-Python` 显式指定；`-Python` 指定的解释器同样要过这道验证。UTF-8 BOM、先跑全量测试、`--fail-under=100` 退出码透传三个行为不变
+- **覆盖率数字（2026-11-15 实测，命令与输出如下）**：
+  - `python -m coverage run --branch --source=. -m pytest -q` → `524 passed in 24.96s`
+  - `python -m coverage report --include="ledger.py,main.py,conftest.py" --fail-under=100` → `conftest.py 44 0 6 0 100%` / `ledger.py 2138 0 892 0 100%` / `main.py 583 0 198 0 100%` / `TOTAL 2765 0 1096 0 100%`，退出码 **0**
+  - `powershell -File tools\coverage_check.ps1`（`$env:PYTHON` 指向 coverage 7.17.3）→ 末尾 `[coverage_check] 行 + 分支 100%，过`，退出码 **0**
+- **`.coverage` 不进真身**：真身插件目录里发现过一个未跟踪的 `.coverage`（53248 字节，19 个源文件 / 16 个测试文件，说明有人在运行中的插件目录跑过 pytest），已删除；`.gitignore` 覆盖 `.coverage` / `.coverage.*`；**以后一律不在真身目录跑 pytest / coverage，测试只在沙盒跑**
+
 ### 测试
 
 - 默认环境：470 passed（基线 464：新增 6——access_log 往返、v2 无 access_log 兼容、durability 三条、时间契约一条；改造 2——两条有损导入旧测试）
-- 开关环境（DREAM_SCHEDULER_ENABLED=true + EMOTION_ENABLED=true + JJ_MEMORY_AUTO_SINK_EVERY=6）：470 passed
+- 开关环境（DREAM_SCHEDULER_ENABLED=true + EMOTION_ENABLED=true + JJ_MEMORY_AUTO_SINK_EVERY=6）：470 passed（**2026-11-15 复跑存疑**：这三个环境变量会把模块常量直接翻成 true，`test_switch_defaults_false` 一类「默认应为 false」的断言必然红，本轮实测是 498 passed / 4 failed。照这组环境跑不可能是全绿，这行记录待核对，未擅自改写原结论）
 - 全部用临时库，未碰生产账本
+- 2026-11-15 v6 收尾复核：默认环境 **519 passed / 0 failed**；覆盖率封装成 `tools/coverage_check.ps1`（`--branch --source=.`，`report --fail-under=100`，只统计 ledger.py / main.py / conftest.py）。当时行覆盖 2766/2766 语句 0 缺失，分支 1098 个里 1 个 partial（ledger.py 904→912，物理不可达，未加 pragma，等判定）
+- 2026-11-15 v7 打回返工后：默认环境 **524 passed / 0 failed**（+5 守卫用例，`test_creative.py` 15 例正式入库）；**行 2765/2765、分支 1096/1096 双 100%**，`--fail-under=100` 退出码 0。上一个 partial 是被等价重构消掉的，不是 pragma 遮掉的
 
 ### 未做（写清楚，别当成已实现）
 

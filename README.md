@@ -117,7 +117,10 @@ AIGC:
 | `core_rule` | 底层法则（预留） |
 | `access_log` | 访问痕迹：什么时候、因为什么被想起。**不进提交链**，只喂衰减计算 |
 | `message` | 原文链：用户消息一个节点，`digest` 哈希链锁起来，改一字整条对不上。不进提交链 |
+| `creative` | 创作项目的归档（v6）：id / 标题 / 类型 / 状态 / 梗概 / 大纲 / 正文 / 原始 payload / 字数 / 时间。**旁路表**：不进提交链、不参与检索打分，也不碰记忆内容 |
 | `meta` | HEAD、各类计数器、`schema_version`（跟着库走的结构版本） |
+
+**`creative` 的边界**（写清楚，免得被当成第二种记忆）：它是「作品档案」，不是「关于用户的记忆」。写入只走 `upsert_creative` 一个口子，读只走 `get_creative`（单条，带正文）与 `list_creatives`（列表，只带门牌字段）。它不进提交链（改名/改正文不算一次记忆提交），不被 `recall/activate` 检索到，不参与概念建图与衰减淘汰；但搬家时会跟着一起走（格式 v4）。
 
 ## 五、用法
 
@@ -205,9 +208,13 @@ LLM 工具（仅限授权会话私聊）：
 要改配置     → ledger.remember_profile(...)
 ```
 
-**结构版本**：`meta.schema_version` 跟着库走，不跟代码走。老库没这个键会被认成 0 号，自动升到当前版本（升之前不碰任何投影表）。当前版本号以 `ledger.py` 里的 `SCHEMA_VERSION` 为准（现在是 v5：否认/状态档/原文锚/梦骨架）。反过来，**库比代码新就拒绝打开**——迁移是单向的，硬开只会把新列悄悄丢掉。
+**结构版本**：`meta.schema_version` 跟着库走，不跟代码走。老库没这个键会被认成 0 号，自动升到当前版本（升之前不碰任何投影表）。当前版本号以 `ledger.py` 里的 `SCHEMA_VERSION` 为准（现在是 v6：在 v5 的否认/状态档/原文锚/梦骨架之上加了创作项目旁路表 `creative`，纯加法、幂等）。反过来，**库比代码新就拒绝打开**——迁移是单向的，硬开只会把新列悄悄丢掉。
 
 **dump / load**：`/记忆备份` 写一份 JSONL，头一行是文件头（格式名、格式版本、结构版本、接口版本、每表行数清单、总行数），之后一行一条记录，最后一行是 `__eof__` 尾部标记。导入 v2 及以后的备份一律严格：坏行、截断、行数对不上直接报错，落库前先在临时库预演一遍 `health_check`，通过才切换（原库全程不写）；v1 老备份保持宽容兼容。
+
+**备份格式版本**：当前 `DUMP_VERSION = 4`。v2 加了行数清单与 `__eof__`，v3 把 `access_log` 纳入备份，v4（2026-11-15）把 `creative` 纳入备份——创作正文与原始档也在里面。**新版代码能读旧备份，旧版代码读不了新备份**：v4 备份在只认 v3 的旧代码里会被文件头拒收，先升级代码再导入。v3 及更早的备份里没有创作项目，导入后 `creative` 表为空——这是「本来就没有」，不是恢复失败（`warnings` 会写一句）。
+
+**替换式恢复与创作**：`load_jsonl(..., replace=True)` 只清空「备份真的带来」的表。拿一份不含 `creative` 的旧备份做替换式恢复时，本地已有的创作项目会**原样保留**（而不是被静默删光），结果里的 `warnings` 会报「备份不含 creative 表（结构 vN），本地 M 条创作已保留」。只有备份自己带 `creative`（结构 v6 / 格式 v4）才会整体替换。
 
 ```python
 led.dump_jsonl("backup.jsonl")          # 整本账：meta + 提交链 + 提交行 + 所有投影表
@@ -230,6 +237,7 @@ new.load_jsonl("backup.jsonl", replace=True)   # 要覆盖得自己说
 | `flush / compact / stats / health_check` | 维护 |
 | `dump_jsonl / load_jsonl` | 搬家 |
 | `materialize / history / show_commit` | 回放与追溯 |
+| `upsert_creative / get_creative / list_creatives` | 创作项目归档（v6 旁路表：不进提交链、不参与检索） |
 
 ## 九、测试
 
@@ -238,6 +246,29 @@ python -m pytest tests/ -q
 ```
 
 或者直接跑 `python tests/test_ledger.py` 看输出。数量不写死在文档里（写了必漂移），以验证命令的实际结果为准。不依赖 AstrBot 主体，也不依赖网络。
+
+### 覆盖率口径
+
+只统计 `ledger.py` / `main.py` / `conftest.py` 三个文件；`tests/` 自身不计入（测试代码给自己刷覆盖率没有意义）。口径是**行 + 分支双 100%**：
+
+```bash
+python -m coverage run --branch --source=. -m pytest -q
+python -m coverage report --include="ledger.py,main.py,conftest.py" -m
+python -m coverage report --include="ledger.py,main.py,conftest.py" --fail-under=100
+```
+
+只需要装 `coverage`，**不用** pytest-cov 插件，解释器是哪个都行。`-m` 那行会把没走到的分支逐条列成 `行->行`，补测试对着它打就行。
+
+Windows 上用封装脚本（不给 `-Python` 就自己找装了 coverage 的解释器：先看 `$env:PYTHON`，再试 PATH 里的 `python`、`python3`，每个都实地跑一遍 `-m coverage --version` 验过才用；全找不到会明确报错，让你用 `-Python` 指过去）：
+
+```powershell
+.\tools\coverage_check.ps1
+.\tools\coverage_check.ps1 -Python "C:\path\to\python.exe"   # 显式指定，跳过探测
+```
+
+脚本先跑全量测试，再按上面的 include 报覆盖率，`--fail-under=100` 不达标就非 0 退出。当前状态：**行 2765/2765、分支 1096/1096 双 100%**，`--fail-under=100` 退出码 0。上一版遗留的那个 partial（`ledger.py` 904→912，`classify_conflict` 里被前两条提前 return 挡住的死分支）已经用**等价重构**消掉——删掉恒真条件、把 body 平铺，注释写明「能走到这里，前提是 892/895 两处提前返回仍在」，`tests/test_classify_conflict_guards.py` 把这个前提钉成了用例，没有用 `pragma: no cover` 遮盖。
+
+覆盖率数据是**本机测量产物，不是源码**：`.coverage` / `.coverage.*` 已进 `.gitignore`。请只在沙盒/临时副本里跑 pytest 与 coverage，**不要在运行中的插件目录跑**——那会往生产目录里扔未跟踪的 `.coverage`。
 
 **关于包索引**：本项目不绑定任何镜像源，仓库配置保持地域中立，uv 默认走官方 PyPI。如果你所在网络访问 pypi.org 较慢，可以自行设置镜像，例如设环境变量 `UV_DEFAULT_INDEX`，或在 uv 命令上加 `--index-url` 参数，把索引指向你选定的镜像（阿里云、清华等均有 PyPI 镜像，可自选）。镜像属于个人网络环境的选择，不写入仓库配置。
 

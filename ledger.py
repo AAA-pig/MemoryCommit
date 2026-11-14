@@ -49,7 +49,11 @@ log = logging.getLogger(__name__)
 #     新表：memory_condition（条件并存）/ memory_status（状态档，append-only）/
 #     dream_proposal（梦唯一写入口）/ memory_source_anchor（增量原文锚）/
 #     user_denial（用户否认，权重最高）。
-SCHEMA_VERSION = 5
+# v6：创作项目旁路表 creative（2026-11-15）。纯加法：id 主键 + 可读正文
+#     body + 整条原始 payload；不碰 memory 主表、不进提交链、不参与任何
+#     检索打分，只供 upsert_creative / get_creative / list_creatives 用。
+#     created_seq 是本表先后序号（MAX+1），不占账本全局 created_seq。
+SCHEMA_VERSION = 6
 
 # 给宿主看的接口版本。公开方法的签名/返回结构变了才 +1，跟表结构是两件事：
 # 换了个内核但数据没动，只该动这个；数据加了列，只该动上面那个。
@@ -65,8 +69,10 @@ CORE_API_VERSION = 2
 # 破坏性变更：旧代码（只认 v2）读到 v3 备份会在文件头拒收——
 # 「备份格式 v3 比当前支持的 v2 新」；反之 v2 老备份没有 access_log 段，
 # 新代码照收，只是访问明细不在里面（这正是当年那个洞）。
+# v4（2026-11-15）：creative 表纳入备份（schema v6）。同 access_log 先例：
+# 升本的搬家不带创作项目就是丢数据；v4 备份旧代码拒收，v3 及以下照收。
 DUMP_FORMAT = "jj-memory-dump"
-DUMP_VERSION = 3
+DUMP_VERSION = 4
 
 # 搬家时要带走的表，顺序按「先元信息、后投影」，导入时不会因为顺序互相绊住
 DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
@@ -76,10 +82,13 @@ DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
                # 状态档丢了会冤枉记忆，否认丢了会放跑幻觉，锚丢了断回原文的路。
                "memory_condition", "memory_status", "dream_proposal",
                "memory_source_anchor", "user_denial",
-               # v3（P0-1）：access_log 是运行状态不是事实，但近期命中与
-               # 工作记忆复出按时间窗口吃它的明细，备份丢了它，迁移前后
-               # 的行为就对不上——体温计的读数历史也是要搬家的。
-               "access_log")
+                # v3（P0-1）：access_log 是运行状态不是事实，但近期命中与
+                # 工作记忆复出按时间窗口吃它的明细，备份丢了它，迁移前后
+                # 的行为就对不上——体温计的读数历史也是要搬家的。
+                "access_log",
+                # v4/v6（2026-11-15）：creative 是创作项目正文与原始档，
+                # 搬家丢表就是丢作品，必须带走。
+                "creative")
 
 # 每张表导出时的稳定排序，纯粹为了 diff 好看，往返不依赖顺序
 _DUMP_ORDER = {
@@ -99,6 +108,7 @@ _DUMP_ORDER = {
     "memory_source_anchor": "memory_id, message_seq",
     "user_denial": "id",
     "access_log": "id",
+    "creative": "created_at, id",
 }
 
 # meta 里属于「这台机器此刻的状态」而不属于「账本内容」的键，导出时跳过
@@ -330,6 +340,24 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_proposal_status ON dream_proposal(status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_anchor_memory ON memory_source_anchor(memory_id)",
     "CREATE INDEX IF NOT EXISTS idx_denial_memory ON user_denial(memory_id, at)",
+    # v6 · 创作项目旁路表（2026-11-15）。outline 存 JSON 字符串、payload 存
+    # 整条原始 JSON（json.dumps ensure_ascii=False）；body 是 draft_chunks
+    # 合并后的可读正文。不进提交链（照 memory_status 旁路先例）。
+    """CREATE TABLE IF NOT EXISTS creative (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        work_type TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT '',
+        premise TEXT NOT NULL DEFAULT '',
+        outline TEXT NOT NULL DEFAULT '',
+        body TEXT NOT NULL DEFAULT '',
+        payload TEXT NOT NULL DEFAULT '{}',
+        current_chars INTEGER NOT NULL DEFAULT 0,
+        target_chars INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        created_seq INTEGER NOT NULL DEFAULT 0)""",
+    "CREATE INDEX IF NOT EXISTS idx_creative_seq ON creative(created_seq)",
 )
 
 DEFAULT_META = {
@@ -526,8 +554,36 @@ def _migrate_4_to_5(led: "Ledger", cx: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_5_to_6(led: "Ledger", cx: sqlite3.Connection) -> None:
+    """5 → 6：创作项目旁路表 creative（2026-11-15）。
+
+    照 v4_to_5 先例：DDL 与 SCHEMA_STATEMENTS 重复一份，
+    CREATE TABLE IF NOT EXISTS，老库升上来建表，新库建表语句早已生效。
+    纯加法：memory 主表与检索逻辑一行不动。
+    """
+    for stmt in (
+        """CREATE TABLE IF NOT EXISTS creative (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            work_type TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT '',
+            premise TEXT NOT NULL DEFAULT '',
+            outline TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            payload TEXT NOT NULL DEFAULT '{}',
+            current_chars INTEGER NOT NULL DEFAULT 0,
+            target_chars INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            created_seq INTEGER NOT NULL DEFAULT 0)""",
+        "CREATE INDEX IF NOT EXISTS idx_creative_seq ON creative(created_seq)",
+    ):
+        cx.execute(stmt)
+    return None
+
+
 _MIGRATIONS = {0: _migrate_0_to_1, 1: _migrate_1_to_2, 2: _migrate_2_to_3,
-               3: _migrate_3_to_4, 4: _migrate_4_to_5}
+               3: _migrate_3_to_4, 4: _migrate_4_to_5, 5: _migrate_5_to_6}
 
 
 # memory 表里这俩列不是「记忆内容」，是「记忆被翻过多少次」的缓存。
@@ -845,13 +901,14 @@ def classify_conflict(a_summary: str, b_summary: str,
         return CONFLICT_PERSPECTIVE
     # 4) 真互斥候选：同一时间、同一场景下词面互斥 → 才可能是幻觉，
     #    而且还要过原文对账（判据只有一句：原文里根本没这回事）
-    if not (scene_a and scene_b and scene_a != scene_b) and \
-            (not win_a or not win_b or _windows_overlap(win_a, win_b)):
-        env_a = _condition_part(ca, "env")
-        env_b = _condition_part(cb, "env")
-        env_same = (env_a == env_b) if (env_a or env_b) else True
-        if env_same and _mutex_hit(a_summary, b_summary):
-            return CONFLICT_MUTEX
+    #    能走到这里，前提是 892/895 两处提前返回仍在：
+    #    场景不同（892）与时间窗不重叠（895）已经各自 return，
+    #    所以此处不必再判一次，直接平铺进互斥候选。
+    env_a = _condition_part(ca, "env")
+    env_b = _condition_part(cb, "env")
+    env_same = (env_a == env_b) if (env_a or env_b) else True
+    if env_same and _mutex_hit(a_summary, b_summary):
+        return CONFLICT_MUTEX
     # 条件不足：挂 conflicted 等证据，不许顺手判成错
     return CONFLICT_UNDETERMINED
 
@@ -3298,6 +3355,94 @@ class Ledger:
                        (memory_id, message_seq, (digest or "")[:64], at))
         return {"memory_id": memory_id, "message_seq": message_seq}
 
+    # -- 创作项目（creative，v6 旁路表：不进提交链、不碰记忆检索）--
+
+    def get_creative(self, creative_id: str) -> Optional[Dict[str, Any]]:
+        """按 id 读一条创作项目（含正文 body 与原始 payload）。没有返回 None。"""
+        row = self._query_one(
+            "SELECT * FROM creative WHERE id = ?", ((creative_id or "").strip(),))
+        return dict(row) if row else None
+
+    def list_creatives(self) -> List[Dict[str, Any]]:
+        """列全部创作项目，只带轻量字段（id/title/work_type/status/
+        current_chars），不带正文与 payload——列表只看门牌，不搬家具。"""
+        rows = self._query_all(
+            "SELECT id, title, work_type, status, current_chars"
+            " FROM creative ORDER BY created_at, id")
+        return [dict(r) for r in rows]
+
+    def upsert_creative(self, creative_id: str, title: str,
+                        work_type: str = "", status: str = "", premise: str = "",
+                        outline: Any = None, body: str = "", payload: Any = None,
+                        current_chars: int = 0, target_chars: int = 0,
+                        created_at: str = "", updated_at: str = "") -> Dict[str, Any]:
+        """写入/覆盖一条创作项目（唯一写接口，v6）。
+
+        id 已存在 → 整字段覆盖，但 created_at / created_seq 保留第一次的
+        （出生时间不随改名变化）；不存在 → 插入。outline / payload 收
+        任意可序列化对象，存 json.dumps(ensure_ascii=False)；序列化失败
+        显式抛 LedgerError，不静默写半截。
+
+        照 memory_status 旁路先例：直接事务写库，不进提交链（它不是
+        记忆内容的变更，是另一条业务线的归档）；也不触碰 memory 表、
+        线索表或任何检索打分。
+        """
+        cid = (creative_id or "").strip()
+        title = (title or "").strip()
+        if not cid:
+            raise LedgerError("创作项目 id 不能为空")
+        if not title:
+            raise LedgerError("创作项目标题不能为空：%s" % cid)
+        try:
+            outline_json = json.dumps("" if outline is None else outline,
+                                       ensure_ascii=False)
+            payload_json = json.dumps({} if payload is None else payload,
+                                       ensure_ascii=False)
+        except Exception as e:
+            raise LedgerError(
+                "创作项目 %s 的 outline/payload 无法序列化为 JSON：%r" % (cid, e))
+        at = now_str()
+        cols = {
+            "title": title,
+            "work_type": (work_type or "").strip(),
+            "status": (status or "").strip(),
+            "premise": premise or "",
+            "outline": outline_json,
+            "body": body or "",
+            "payload": payload_json,
+            "current_chars": max(0, int(current_chars or 0)),
+            "target_chars": max(0, int(target_chars or 0)),
+            "updated_at": updated_at or at,
+        }
+        with self._tx() as cx:
+            old = cx.execute("SELECT * FROM creative WHERE id = ?",
+                             (cid,)).fetchone()
+            if old is None:
+                seq = cx.execute(
+                    "SELECT COALESCE(MAX(created_seq), 0) + 1 AS n"
+                    " FROM creative").fetchone()["n"]
+                cx.execute(
+                    "INSERT INTO creative(id, title, work_type, status, premise,"
+                    " outline, body, payload, current_chars, target_chars,"
+                    " created_at, updated_at, created_seq)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (cid, cols["title"], cols["work_type"], cols["status"],
+                     cols["premise"], cols["outline"], cols["body"],
+                     cols["payload"], cols["current_chars"], cols["target_chars"],
+                     created_at or at, cols["updated_at"], int(seq)))
+                action = "insert"
+            else:
+                cx.execute(
+                    "UPDATE creative SET title=?, work_type=?, status=?,"
+                    " premise=?, outline=?, body=?, payload=?, current_chars=?,"
+                    " target_chars=?, updated_at=? WHERE id=?",
+                    (cols["title"], cols["work_type"], cols["status"],
+                     cols["premise"], cols["outline"], cols["body"],
+                     cols["payload"], cols["current_chars"], cols["target_chars"],
+                     cols["updated_at"], cid))
+                action = "update"
+        return {"id": cid, "action": action, "updated_at": cols["updated_at"]}
+
     # -- 咬合点（memory 对梦只露这两个口）--
 
     def propose_clues(self, query: str = "", limit: int = 6,
@@ -3754,9 +3899,21 @@ class Ledger:
             # 恢复在临时库验证通过再切换（R5）：预演失败原库一字节不动
             self._rehearse_restore(rows)
 
+        # v6 保护（2026-11-15）：creative 已经进了 DUMP_TABLES，替换式恢复
+        # 若还照「按表清空」一刀切，拿一份不含 creative 的旧备份（schema v5
+        # 及更早 / 格式 v3 及更早）来恢复，就会把所有创作项目静默删光——
+        # 那是正文，提交链里重放不出来。所以清空只清「备份真的带来」的表：
+        # 备份没带 creative，本地创作原样保留，并在 warnings 里如实报数。
+        backup_schema = int(header.get("schema_version") or 0)
+        creative_in_backup = "creative" in (header.get("tables") or {})
+        local_creative = self._query_one(
+            "SELECT COUNT(*) AS n FROM creative")["n"]
+
         with self._tx() as cx:
             if replace:
                 for tbl in reversed(DUMP_TABLES):
+                    if tbl == "creative" and not creative_in_backup:
+                        continue
                     cx.execute("DELETE FROM %s" % tbl)
             written, dropped_cols = self._write_dump_rows(cx, rows)
 
@@ -3764,6 +3921,20 @@ class Ledger:
         migrated = self._migrate()
 
         warnings: List[str] = []
+        # 结构版本低于 6、或备份根本没列 creative 表：这次恢复碰不到创作项目。
+        # 替换式恢复尤其要说清楚「本地那几条是保留下来的，不是恢复出来的」。
+        if backup_schema < 6 or not creative_in_backup:
+            ver = "v%s" % backup_schema if backup_schema else "未知"
+            if replace and local_creative:
+                warnings.append(
+                    "备份不含 creative 表（结构 %s），本地 %d 条创作已保留"
+                    % (ver, local_creative))
+            elif replace:
+                warnings.append(
+                    "备份不含 creative 表（结构 %s），本地也没有创作项目" % ver)
+            else:
+                warnings.append(
+                    "备份不含 creative 表（结构 %s），本次导入未涉及创作项目" % ver)
         head = self.head()
         if head and not self.show_commit(head):
             warnings.append("HEAD %s 在提交表里找不到" % head)
