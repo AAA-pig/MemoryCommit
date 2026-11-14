@@ -186,13 +186,22 @@ def test_working_confirm_nothing(plugin, monkeypatch):
 
 def test_compact_reports_nothing(plugin):
     plugin.ledger.remember("只有一条")
-    assert "不用压缩" in _cmd(plugin, "cmd_compact", "/记忆压缩")
+    assert "没什么可压的" in _cmd(plugin, "cmd_compact", "/记忆压缩")
+
+
+def test_compact_requires_confirmation(plugin):
+    """R1：压缩是不可逆操作，无确认不执行（评审复测：/记忆压缩 1 一直无确认直接跑）。"""
+    for i in range(5):
+        plugin.ledger.remember("记忆 %d" % i)
+    out = _cmd(plugin, "cmd_compact", "/记忆压缩 2")
+    assert "确认" in out and "不可逆" in out
+    assert plugin.ledger.stats()["commits"] == 5, "无确认却真的压了"
 
 
 def test_compact_applies_and_blocks(plugin, monkeypatch):
     for i in range(13):
         plugin.ledger.remember("记忆 %d" % i)
-    out = _cmd(plugin, "cmd_compact", "/记忆压缩 10")
+    out = _cmd(plugin, "cmd_compact", "/记忆压缩 10 确认")
     assert "压好了" in out
 
     from ledger import LedgerError
@@ -201,7 +210,7 @@ def test_compact_applies_and_blocks(plugin, monkeypatch):
         raise LedgerError("压不了")
 
     monkeypatch.setattr(plugin.ledger, "compact", boom)
-    assert "没压成" in _cmd(plugin, "cmd_compact", "/记忆压缩 3")
+    assert "没压成" in _cmd(plugin, "cmd_compact", "/记忆压缩 3 确认")
 
 
 # -- /记忆导出 / 备份 / 自检 ------------------------------------------------
@@ -680,6 +689,43 @@ def test_as_int_and_float_edges(mod):
     assert mod._as_int("", 5) == 5
     assert mod._as_float("1.5", 0.0) == 1.5
     assert mod._as_float(None, 0.25) == 0.25
+
+
+def test_as_int_overflow_falls_back(mod):
+    """N4：int(float("inf")) 抛 OverflowError，不能让它在工具调用里炸出去。"""
+    assert mod._as_int(float("inf"), 5) == 5
+    assert mod._as_int(float("-inf"), 5, low=1) == 5
+
+
+def test_fmt_hit_marks_disputed(mod):
+    """R3：显式检索输出标出争议记忆，别让它看起来和普通记忆一样可信。"""
+    row = {"id": "m7", "summary": "用户讨厌香菜", "grade": 1, "score": 0.34,
+           "match": "direct", "disputed": True}
+    out = mod._fmt_hit(row, 1)
+    assert "有争议" in out
+    plain = mod._fmt_hit({"id": "m8", "summary": "用户喜欢香菜", "grade": 1,
+                          "score": 0.34, "match": "direct"}, 2)
+    assert "有争议" not in plain
+
+
+def test_inject_memory_survives_message_str_crash(mod, plugin, monkeypatch):
+    """N4：get_message_str() 炸掉时只算「落链失败」，不再升级成 UnboundLocalError。
+
+    修复前：said 只在 try 块里赋值，异常后长 prompt 分支直接 UnboundLocalError，
+    「唤起失败」计数 +1，整轮注入消失；修复后唤起照常走（query 变空串）。
+    """
+    import main as m
+    plugin.ledger.remember("用户喜欢喝热咖啡", importance=0.8)
+
+    class _BoomEvent(_Event):
+        def get_message_str(self):
+            raise RuntimeError("事件坏了")
+
+    req = _Req("咖啡")
+    asyncio.run(plugin.inject_memory(_BoomEvent("咖啡"), req))
+    assert plugin.failures.counts.get("原文落链失败") == 1
+    assert "唤起失败" not in plugin.failures.counts, "落链失败升级成了唤起失败"
+    assert "热咖啡" in (req.system_prompt or "")
 
 
 def test_short_clips(mod):

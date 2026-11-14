@@ -100,7 +100,7 @@ MAX_GRADE = 2
 
 # 自动沉淀条目的机器可读类型标记（N1 降级）。这类条目是「聊过什么」的原文
 # 索引：正文只是前 60 字摘录 + 词面碎片关键词，当普通事实注入会把索引抬成
-# 结论。统一标签「自动沉淀」保留给人看和显式检索；唤起（activate）五条路线
+# 结论。统一标签「自动沉淀」保留给人看和显式检索；唤起（activate）各条路线
 # 按 auto_sink_ids() 识别这个标记并一律排除，普通记忆注入路径不再收它们。
 AUTO_SINK_TYPE_TAG = "type:auto_sink"
 
@@ -2237,10 +2237,12 @@ class Ledger:
                  context: Optional[dict] = None) -> Dict[str, Any]:
         """聊天前的一次「唤起」。
 
-        三条路依次补位：
-          1. 检索：query 真的命中了什么
-          2. 联想：沿标签连边一跳，把沾边的带出来
-          3. 激活：什么都没命中时，让新鲜且重要的自己冒出来
+        四条路依次补位（route 的真实取值写在括号里，别再另起一套名字）：
+          1. 检索（search）：query 真的命中了什么
+          2. 联想（associate）：沿线索/标签连边一跳，把沾边的带出来
+          3. 激活（activate）：没有 query 时，让新鲜且重要的自己冒出来
+          4. 兑底（fallback）：有 query 却零命中时保守兑底；全被冷却挡光
+             则整轮标 fallback_blocked（一条都没捞出时 route 是 none）
         冷却期内刚浮现过的记忆不再重复出现，免得每轮都念同一件事。
 
         slots 是「这一轮最多说出口几条」，只影响注入，不影响谁留在工作记忆里。
@@ -2254,12 +2256,13 @@ class Ledger:
         picked: List[Dict[str, Any]] = []
         seen = set()
         routes: List[str] = []
-        # 候选接纳统一入口的可见性与状态策略（R3）：disputed（被否认）五条路线
-        # （direct / clue / graph / fresh / fallback）永久拦；coexist（条件并存）
-        # 只在语境能判定且条件匹配时放行，判不出/不匹配同样拦。
+        # 候选接纳统一入口的可见性与状态策略（R3）：disputed（被否认）
+        # 四条路线（search / associate / activate / fallback）永久拦，
+        # fallback_blocked 是 fallback 挡光后的结果值，同样拿不到任何条目；
+        # coexist（条件并存）只在语境能判定且条件匹配时放行，判不出/不匹配同样拦。
         # 显式检索 recall 不受此限，仍能找到但 disputed 降权。
         # N1 降级同走这里：自动沉淀条目是原文索引，不管用户把轮次开到几，
-        # 都不许当普通事实进系统提示，五条路线一起拦。
+        # 都不许当普通事实进系统提示，所有路线一起拦。
         quiet = self.quiet_ids(context)
         auto_sink = self.auto_sink_ids()
         # N7：hidden 在这里定死，往下传给每条路线的候选池——排除发生在

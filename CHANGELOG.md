@@ -1,18 +1,91 @@
 # CHANGELOG
 
+## 1.5.2 — 2026-11-14
+
+第三轮锐评（fb9dfa4）的修复：让「沉淀不进提示词」对存量数据也成立，并把沉淀在存储层降回索引。
+
+### N6 存量沉淀识别与迁移
+
+- **识别口径与建图口径同源**：`auto_sink_ids()` 同时认完整标签 `type:auto_sink` 与「自动沉淀」（`AUTO_SINK_MARKERS`），与 `is_machine_tag` 一致；`type:auto_sink_x` 这类前缀撞车仍不会被认成沉淀（此前这个承诺没有测试钉住，12 个定点变异里唯一全绿漏网的那个）
+- **打开旧库自动迁移**：新增 `Ledger._migrate_auto_sink_legacy()`，给 1.5.0 期间（11-12～11-14，默认每 6 轮写一条）写出的存量沉淀补 `type:auto_sink` 标记、摘掉 concept 为机器标签的 `memory_link` 边；走提交链（`CommitBuilder.retype_memory` / `unlink_edge`，删除行带完整 from|to|concept 身份，R4 的坑不会踩），回放与自检对得上；先查后写，重复执行不出错
+- 实测（评审复现脚本 probe3_ledger.py A 段，临时库）：`auto_sink_ids()` 由 `[]` 变为全部 6 条存量；concept=自动沉淀 的边 15 → 0；`activate("空调")` 由返回沉淀变为只返回真事实；系统提示里不再出现「自动沉淀」
+
+### N7/N8 排除前移到候选池截断之前
+
+- `recall` / `_clue_bridge` / `_fresh_candidates` 都新增 `exclude` 参数，在排序与截断之前过滤；`activate` 把 `hidden = quiet | auto_sink` 一次算好传给每条路线的候选池，`take()` 里那道检查保留作双保险。显式开启沉淀后，10 条同主题沉淀不再把真事实挤出 search 路线（评审复现表第 3 行：真事实掉出前 9 → 稳在 search）
+- fallback 的「破例浮现」先剔 hidden 再挑 `min(_surfaced)`：沉淀 `_surfaced` 恒为 0，此前每次都被选中又因 auto_sink 排除拿不到，整轮 `fallback_blocked`；现在冷却期也能浮出真事实
+
+### N9 存储层把索引降回索引（部分）
+
+- `plan_working_set` 跳过 `auto_sink_ids()`：沉淀不抢工作记忆名额，不再把真事实挤到零级、被冲刷标成 delete
+- `flush_plan` 跳过沉淀条目，且冲刷量基准取「普通记忆」里最新的 `created_seq`——写一条沉淀不再让所有普通记忆的冲刷量同步涨一格
+- 沉淀正文去掉字面前缀「自动沉淀：」：「是什么」由 tags 的机器标记表达，正文重复一次只会让「自动」「沉淀」的词面在检索里命中一切沉淀条目
+
+### N10 建图精确集合判定
+
+- `_auto_link` 的候选邻居改精确判定：子串 LIKE 只缩小扫描范围，命中后按逗号分隔的完整标签集合确认 tag 确实在其中，且目标条目自身不带机器标签；`ORDER BY created_seq DESC LIMIT 32` 保证顺序确定，凑够 8 条即停。「自动」「沉淀」「auto」「sink」这类子串标签不再把普通记忆连到沉淀上，真共享标签的普通记忆之间也拿得到名额
+
+### 修（低成本项）
+
+- **N4 两个崩溃**：`inject_memory` 里 `said = ""` 预先初始化（`get_message_str()` 炸掉时不再 UnboundLocalError，把「落链失败」升级成「唤起失败」）；`_as_int` 多捕 `OverflowError`（`int(float("inf"))` 不再炸出工具调用）
+- **R1：/记忆压缩 加确认词**：与 /记忆冲刷、/记忆容量 同一口径，只认独立的「确认」，无确认只提示不执行（评审复测：`/记忆压缩 1` 一直无确认直接执行）
+- **R3：显式检索输出标出争议记忆**：`_fmt_hit` 对 `disputed` 条目加「有争议（被否认过，待对证）」标注，/记忆 与 memory_search 工具都生效
+- **DREAM / EMOTION 环境开关测试隔离**：两个测试文件在 import ledger 之前摘掉环境开关，宿主进程开着它们跑测试不再红（此前实测 3+1 条失败）；设置 `DREAM_SCHEDULER_ENABLED=true` + `EMOTION_ENABLED=true` 重跑全量实测 459 passed
+- **metadata.yaml 改成真实作者与仓库**：`AAA-pig` / `github.com/AAA-pig/MemoryCommit`（原来是占位的 `memory-commit` / `lsby/ai-memory`、`repo: local`）
+
+### 文档
+
+- 路线名统一成代码真实 route 值（search / associate / activate / fallback / fallback_blocked / none）：activate 注释、CHANGELOG、README 三处；recall 的 match 值 direct / clue / graph 是「命中来源」不是路线名，已注明
+- README「没命中一字节都不注入」改成与 fallback 说明一致的口径；「沉淀条目不进提示词」补存量迁移说明
+- 更正 1.5.1 段两处陈述：路线名（原写 search / associate / graph / fresh / fallback）；「存量边不自动回收」（N6 迁移落地后已回收）
+- 1.5.1 段补记补全：34bf72d..954ef20 两波改动的完整清单（见 1.5.1 的「补记」小节）
+
+### 测试
+
+- 459 passed（基线 444：新增 14、改造 3——cmd_compact 两条按确认词新行为改写、_as_int 断言修正）。新增：954ef20 写库→新代码打开的迁移测试（含幂等与注入断言）、auto_sink_ids 双标记口径与前缀撞车、10 条沉淀不挤掉 search、fallback 破例浮现跳过沉淀（另钉 eligible 双保险：候选池过滤失效时仍兕底）、沉淀不抢座/不进冲刷计划/不推冲刷量、正文去前缀、子串标签不连沉淀、/记忆压缩 确认词、_fmt_hit 争议标注、_as_int Overflow、落链失败不升级为唤起失败
+- 环境开关反向验证：设 `DREAM_SCHEDULER_ENABLED=true` + `EMOTION_ENABLED=true` 全量重跑，459 passed（修复前 3+1 failed）
+- 全部用临时库；评审自带复现脚本（probe3_ledger / probe3_force / probe3_chain）在修复后重跑，A/B/B2/C/F 段全部转为预期行为
+
+### 未做（写清楚，别当成已实现）
+
+- **沉淀仍在 memory 表里（N9 彻底方案未做）**：评审建议的「移出 memory 表、进 message_digest 旁路表（挂起止 seq 与会话 ID）」本轮不做。原因：动表结构要加 schema 版本迁移、备份清单与回放口径都要跟着改，牵动面远大于本轮「止血 + 存量迁移」的范围；现在的减损是「沉淀不抢座、不计量、不建图、不进提示词」，但它们仍占 memory 行数、仍进线索表（1.5.1 未做项延续）、正文仍会进显式检索结果（设计如此）。旁路表留给后续轮次
+- N11（`type:` 前缀被整体保留但工具文档没告诉模型）未动：两条修法（入口剥掉 type: 标签 / 工具说明写明保留前缀）各有代价，等下一个写入侧窗口一起做
+- R4 幽灵基线（旧代码生成的库 health=False、load 被预演拒绝）没有修复路径；R5 的 v1 老备份宽容校验照旧；R6 的 `run_once("", scope_key="")` 仍产出全局梦；N2 普通标签枢纽（20 条同标签 124 边）未变
+- N1 老问题：自动沉淀仍无原文锚、仍混会话、仍是全局 scope——等 message_digest 旁路表一起解
+
 ## 1.5.1 — 2026-11-14
 
-自动沉淀降级收尾（N1 + N2）。1.5.0 之后两轮改动当时没进本文件、版本号也没动，这次一并补记，并把「类型标记参与建图」这个新洞修掉。
+自动沉淀降级收尾（N1 + N2）。1.5.0 之后两波改动当时没进本文件、版本号也没动，这次补记（完整清单见下方「补记」小节，2026-11-14 追记补全），并把「类型标记参与建图」这个新洞修掉。
+
+### 补记：1.5.0 发布后、1.5.1 之前的两波改动（34bf72d..954ef20）
+
+**第一波（34bf72d / 468731f / e06a6ee，P0/P1 修复）：**
+
+- **自动沉淀最初引入**：外壳不依赖模型自觉，每 6 轮（`JJ_MEMORY_AUTO_SINK_EVERY`）把原文折成一条 day 记忆——当时默认开启，1.5.1 改默认关
+- **写路径失败计数**：`FailureCounter`，失败不再只留一行 warning，/记忆自检 能报「哪条写路径在悄悄失败」
+- **WAL 定期截断**：挂维护节流里做 `wal_checkpoint(TRUNCATE)`，阈值 `JJ_MEMORY_WAL_CHECKPOINT_BYTES`、冷却 5 分钟（实测 3.6MB 从不回落）
+- **维护任务节流**：`MAINTAIN_EVERY`（R8）：首轮与之后每 N 轮各检查一次，修掉旧写法 N=1 时永不执行的错
+- **原文链检索上限**：`SEARCH_CANDIDATE_CAP=200` / `SEARCH_EXPANDED_CAP=2000`，无命中时扩窗重试并标 truncated，不再全表逐行切词
+- **遗忘报错说清原因**；命令面与边界分支补测（ledger/main 行覆盖率 100%）
+
+**第二波（954ef20，第二轮评审修复）：**
+
+- **R1 鉴权**：11 个 /记忆* 命令与五个 LLM 工具全部只认 owner（UMO 名单），非 owner 统一拒答；备份只能落专用目录、默认不覆盖、路径成分剥掉；破坏性操作精确确认（「确认」必须是独立词）
+- **R5 备份 v2**：文件头带每表行数清单、尾部 `__eof__` 标记、导入严格校验、落库前临时库预演（`DUMP_VERSION 1 → 2`）
+- **R4 删除行带完整行身份**：`memory_link` 删除的 row_key 是完整 from|to|concept，重放不出幽灵行；自检投影对账覆盖全部投影表
+- **R6 scope 贯穿**：线索桥、图谱一跳、梦产出的每一跳都限制在会话（或全局共享）
+- **R3 条件并存语义**：disputed 永久拦（不吃条件豁免）；coexist 给语境且条件匹配才放行，判不出/不匹配保守拦（`condition_allows()`、`quiet_ids(context)`）
+- **R2 原文锚绑到具体请求的事件**：不同会话/并发各锚各的，落链失败显式置 0
 
 ### 自动沉淀默认关（N1 降级）
 
 - **默认行为变了**：自动沉淀从「每 6 轮写一条」改为默认关（`JJ_MEMORY_AUTO_SINK_EVERY` 默认 0），不打环境变量就一条也不写
 - 要开必须显式设 `JJ_MEMORY_AUTO_SINK_EVERY=N`：一问一答算一轮，攒满 N 轮把这几轮原文折成一条 day 记忆
-- 开了也只是索引：写出的条目带 `type:auto_sink` 类型标记 + 统一标签「自动沉淀」，唤起（activate）五条路线（search / associate / graph / fresh / fallback）一律不收——**开了也不会进系统提示**；显式检索（recall 搜「自动沉淀」或正文词面）照样找得到
+- 开了也只是索引：写出的条目带 `type:auto_sink` 类型标记 + 统一标签「自动沉淀」，唤起（activate）各条路线（search / associate / activate / fallback）一律不收——**开了也不会进系统提示**；显式检索（recall 搜「自动沉淀」或正文词面）照样找得到
 
 ### 修
 
-- **机器/管理标签参与建图**。`type:auto_sink` 与「自动沉淀」写进 `memory.tags`，而 tags 即概念、写入即织边：实测 5 条沉淀探针自己连出 20 条 `memory_link`（「自动沉淀」10 条、`type:auto_sink` 10 条），把「聊过什么」的原文索引抬成了图谱上的语义同源——「元数据标签被当成语义连边」（N2）的隐患多出一组。现在唯一建图入口 `_auto_link` 统一过滤机器标签（`type:` 前缀 + 「自动沉淀」统一标签，`ledger.is_machine_tag`）：沉淀条目一条 concept 边也不织，正常记忆的语义标签连边照旧。存量库里已织出的这类边不自动回收：默认关后新库不会再产生，注入侧本就有 `auto_sink_ids` 排除兜着，不影响提示词
+- **机器/管理标签参与建图**。`type:auto_sink` 与「自动沉淀」写进 `memory.tags`，而 tags 即概念、写入即织边：实测 5 条沉淀探针自己连出 20 条 `memory_link`（「自动沉淀」10 条、`type:auto_sink` 10 条），把「聊过什么」的原文索引抬成了图谱上的语义同源——「元数据标签被当成语义连边」（N2）的隐患多出一组。现在唯一建图入口 `_auto_link` 统一过滤机器标签（`type:` 前缀 + 「自动沉淀」统一标签，`ledger.is_machine_tag`）：沉淀条目一条 concept 边也不织，正常记忆的语义标签连边照旧。（1.5.2 更正：存量库里已织出的这类边由打开库时的 `_migrate_auto_sink_legacy` 回收，不是「不自动回收」）
 
 ### 测试
 

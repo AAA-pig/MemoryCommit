@@ -190,6 +190,39 @@ def test_n8_fallback_exceptional_surface_skips_sinks(tmp_path):
         led.close()
 
 
+def test_n8_eligible_filter_is_last_resort(tmp_path, monkeypatch):
+    """破例浮现的 eligible 过滤是最后一道：候选池过滤失效时它仍兜底。
+
+    把 _fresh_candidates 的 exclude 短路掉（模拟未来有人改坏候选池
+    过滤），破例浮现仍不许选中沉淀：min(_surfaced) 挑中沉淀 → force
+    被 take 拦 → 整轮 fallback_blocked。这道测试钉住的是 activate 里
+    的 eligible 过滤本身，不是候选池的 exclude。
+    """
+    led = L.Ledger(str(tmp_path / "a.db"))
+    try:
+        for t in ("用户喜欢热咖啡", "用户周末爬山", "用户的猫叫团子"):
+            led.remember(t)
+        led.activate("", slots=3, with_profile=False)  # 三条都刚浮现，进冷却
+        led.remember("自动沉淀：最近 12 条原文（用户 6 条）。开头是「天气不错」",
+                     level="day", tags="自动沉淀,type:auto_sink", importance=0.45)
+        sinks = led.auto_sink_ids()
+        assert len(sinks) == 1
+
+        orig = led._fresh_candidates
+
+        def leak(limit, scope_key="", context=None, exclude=None):
+            # 故意不剔除：把沉淀漏进候选池
+            return orig(limit, scope_key, context, exclude=None)
+
+        monkeypatch.setattr(led, "_fresh_candidates", leak)
+        r = led.activate("量子纠缠", slots=3, dry_run=True, with_profile=False)
+        assert r["route"] == "fallback", \
+            "破例名额被沉淀占住（fallback_blocked），eligible 过滤没兜住"
+        assert not [i for i in r["items"] if i["id"] in sinks]
+    finally:
+        led.close()
+
+
 # -- N9：存储层把索引当一等记忆 ------------------------------------------------
 
 def test_n9_sinks_do_not_seize_working_set(tmp_path):
