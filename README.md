@@ -240,3 +240,19 @@ python -m pytest tests/ -q
 或者直接跑 `python tests/test_ledger.py` 看输出。数量不写死在文档里（写了必漂移），以验证命令的实际结果为准。不依赖 AstrBot 主体，也不依赖网络。
 
 **关于包索引**：本项目不绑定任何镜像源，仓库配置保持地域中立，uv 默认走官方 PyPI。如果你所在网络访问 pypi.org 较慢，可以自行设置镜像，例如设环境变量 `UV_DEFAULT_INDEX`，或在 uv 命令上加 `--index-url` 参数，把索引指向你选定的镜像（阿里云、清华等均有 PyPI 镜像，可自选）。镜像属于个人网络环境的选择，不写入仓库配置。
+
+## 十、clone 之后：启用提交拦截
+
+仓库里带了一个 `.githooks/pre-commit`，用来挡住账本、备份、观测日志这类私人数据被误提交。但 git 不会执行 clone 下来的仓库里的任何东西，所以它默认是关着的，**必须手动接一次**：
+
+```bash
+git config core.hooksPath .githooks      # 通用
+powershell -ExecutionPolicy Bypass -File tools/setup-hooks.ps1   # Windows，效果相同
+sh tools/setup-hooks.sh                  # Linux / macOS，效果相同
+```
+
+这条设置只存在本机的 `.git/config` 里，不进仓库。换机器、重新 clone 都要再跑一次。
+
+拦什么：`*.db`、`*.db-wal`、`*.db-shm`、`*.sqlite*`、`*.jsonl`、`*.log`、`data/`、`backup/`、`记忆账本*`。`.gitignore` 负责让人 `git add` 不进去，hook 负责即使 `git add -f` 硬塞也提交不了。确实要放行：`git commit --no-verify`。
+
+**这不是安全边界，只是防手滑。** 真要让谁都推不上去，只能靠远端权限、分支保护或服务端 hook —— 本地 hook 可以 `--no-verify` 绕过，而且对已经 push 出去的历史无效。
