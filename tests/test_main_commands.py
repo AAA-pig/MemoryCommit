@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """main.py 外壳的全量行为测试（P0-4：命令面与 llm_tool 边界）。
 
 这一份刻意把每条 /记忆* 指令都真跑一遍：以前它们一行都没被测到，
@@ -843,3 +843,93 @@ def test_raw_truncated_note(plugin, monkeypatch):
                         lambda: {"count": 900, "since": "2025-01-01T00:00:00"})
     out = _cmd(plugin, "cmd_raw", "/记忆原话 空调")
     assert "只查了最近 200 条" in out
+
+
+# -- /人格 导入（手写输入） ------------------------------------------------
+
+def test_persona_import_needs_text(plugin):
+    out = _cmd(plugin, "cmd_persona", "/人格 导入")
+    assert "用法" in out and "一行一条" in out
+
+
+def test_persona_import_writes_batch(plugin):
+    out = _cmd(plugin, "cmd_persona", "/人格 导入\n[50] 认准的事会坚持\n说话短句为主")
+    assert "已手写写入 2 条" in out
+    rows = plugin.ledger.list_persona()
+    assert {r["content"] for r in rows} == {"认准的事会坚持", "说话短句为主"}
+    assert {r["priority"] for r in rows} == {50, 0}
+
+
+def test_persona_import_rejects_whole_batch(plugin):
+    out = _cmd(plugin, "cmd_persona", "/人格 导入\n同一条\n同一条")
+    assert "这批没写" in out and "重复" in out
+    assert plugin.ledger.list_persona() == []
+
+
+def test_persona_import_write_error_reported(mod, plugin, monkeypatch):
+    def boom(*a, **kw):
+        raise mod.LedgerError("库锁住了")
+    monkeypatch.setattr(plugin.ledger, "add_persona_batch", boom)
+    out = _cmd(plugin, "cmd_persona", "/人格 导入\n一条")
+    assert "没写上" in out and "库锁住了" in out
+
+
+def test_persona_import_many_shows_ellipsis(plugin):
+    text = "/人格 导入\n" + "\n".join("第%d条" % i for i in range(1, 10))
+    out = _cmd(plugin, "cmd_persona", text)
+    assert "已手写写入 9 条" in out and "…" in out
+
+
+def test_persona_import_file_needs_path(plugin):
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件")
+    assert "用法" in out
+
+
+def test_persona_import_file_missing(plugin, tmp_path):
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % (tmp_path / "nope.txt"))
+    assert "没找到文件" in out
+
+
+def test_persona_import_file_ok(plugin, tmp_path):
+    p = tmp_path / "persona.txt"
+    p.write_text("# 注释不写\n[80] 从文件来的\n", encoding="utf-8")
+    out = _cmd(plugin, "cmd_persona", '/人格 导入文件 "%s"' % p)
+    assert "已手写写入 1 条" in out
+    rows = plugin.ledger.list_persona()
+    assert rows[0]["content"] == "从文件来的" and rows[0]["priority"] == 80
+
+
+def test_persona_import_file_too_big(plugin, tmp_path):
+    p = tmp_path / "big.txt"
+    p.write_bytes(b"x" * (128 * 1024 + 1))
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % p)
+    assert "128KB" in out
+
+
+def test_persona_import_file_bad_encoding(plugin, tmp_path):
+    p = tmp_path / "gbk.txt"
+    p.write_bytes("中文".encode("gbk"))
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % p)
+    assert "读不了" in out
+
+
+def test_package_import_path(tmp_path, monkeypatch):
+    """相对导入那条分支：main 作为包内模块加载时，persona_text 也得导进来。"""
+    import importlib.util
+    import types
+
+    monkeypatch.setenv("JJ_MEMORY_DIR", str(tmp_path))
+    name = "mc_pkg_probe"
+    pkg = types.ModuleType(name)
+    pkg.__path__ = [PLUGIN_DIR]
+    sys.modules[name] = pkg
+    spec = importlib.util.spec_from_file_location(
+        name + ".main", os.path.join(PLUGIN_DIR, "main.py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name + ".main"] = module
+    try:
+        spec.loader.exec_module(module)
+        assert module.parse_persona_text("一条\n")["items"][0]["content"] == "一条"
+    finally:
+        for key in (name + ".main", name + ".ledger", name + ".persona_text", name):
+            sys.modules.pop(key, None)

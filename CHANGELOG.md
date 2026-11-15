@@ -87,6 +87,15 @@
 - **脱敏**：`CHANGELOG.md` 里最后一处本机绝对路径删掉（改为「某个装了 coverage 的虚拟环境」）；`docs/升级-schema5-to-6-方案.md` 里的数据目录改成 `%USERPROFILE%\.local\share\jingjing-memory`，不再写死用户名
 - **实测**：`524 passed / 0 failed`；`tools/coverage_check.ps1` → `ledger.py 2138/2138 + main.py 583/583`（分支 892+198）双 100%，conftest 单列 44/44、6/6，退出码 0
 
+### 人格分区（schema v7）与手写导入（2026-11-15）
+
+- **结构**：`core_rule` 加 `kind` / `source` / `updated_at` 三列（迁移 v6→v7，存量行按 `kind='self'` 认领）。core 分区只读，self 分区可增删改
+- **三道闸**：`restricted_auto_write` 反向守卫（自动路径里一律拒，连 self 分区也不行）、`user_persona_write` 通行令牌（默认关，只有 `/人格`、`memory_persona`、显式播种会开）、`CommitBuilder._push` 底层兜底（绕过写方法直接落 core_rule 同样拒）
+- **静态白名单**：`tests/test_persona_write_surface.py` 用 AST 扫全仓，core_rule 落库点与人格写入口各点名一份清单——多一个位置红（有人加了写路径没说），少一个也红（白名单过期等于谎报覆盖）
+- **哈希哨兵**：meta 存 core 行（id/content/priority）摘要。手工 SQL 改库、备份回灌串号都会露出来；只记 warning、不阻断启动、不自动修，人工确认后 `reseal_persona_core(confirm=True)` 重封
+- **手写导入**：新增 `persona_text.py`（纯解析，不碰库、不开提交）与 `Ledger.add_persona_batch`（整批一个提交，闸与 `add_persona` 同一道）。`/人格 导入 多行文本`、`/人格 导入文件 路径`（UTF-8，≤128KB）。一行一条，`[权重]` 前缀可省，`#` 开头是注释；先全量挑错，一条不合格整批不写——半批写进去比全不写更难收拾
+- **实测**：`621 passed / 0 failed`；`tools/coverage_check.ps1` → `ledger.py 2428 语句 / 1014 分支`、`main.py 734 / 260`、`persona_text.py 45 / 20`，行 + 分支全 100%，退出码 0（persona_text.py 本轮并入生产门禁）
+
 ### 测试
 
 - 默认环境：470 passed（基线 464：新增 6——access_log 往返、v2 无 access_log 兼容、durability 三条、时间契约一条；改造 2——两条有损导入旧测试）
