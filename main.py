@@ -27,12 +27,14 @@ from astrbot.api.star import Context, Star, register
 try:
     from .ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
                          AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
+                         ATTITUDE_OWNER_ID,
                          Ledger, LedgerError, StaleHeadError, match_denial_keywords,
                          tokenize)
     from .persona_text import parse_persona_text
 except ImportError:  # 直接当脚本跑时
     from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
                         AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
+                        ATTITUDE_OWNER_ID,
                         Ledger, LedgerError, StaleHeadError, match_denial_keywords,
                         tokenize)
     from persona_text import parse_persona_text
@@ -112,6 +114,27 @@ def _is_owner(event) -> bool:
 
 # 非 owner 时指令与工具统一的拒答文案
 OWNER_DENY_TEXT = "不可用：记忆账本只在用户和助手的私聊里开放。"
+
+
+def _is_group(event) -> bool:
+    """群聊判定（B5）：unified_msg_origin 的消息类型段含 GroupMessage。
+
+    aiocqhttp 群聊 UMOS 形如 aiocqhttp:GroupMessage:<群号>；私聊是
+    FriendMessage。只认 GroupMessage：其他类型（含私聊与频道）都不算群，
+    非 owner 一律不进账本——口径从严，宁可不记，不许错记。
+    """
+    return "GroupMessage" in (event.unified_msg_origin or "")
+
+
+def _sender_of(event) -> tuple:
+    """当前事件的发送者（B2）：返回 (sender_id, sender_name)。
+
+    拿不到就返回空串——上层对空 speaker_id 的处理是「不写说话人行」，
+    记忆本身照写，沉淀不会因为拿不到发送者而失败。
+    """
+    sid = str(getattr(event, "sender_id", "") or "").strip()
+    name = str(getattr(event, "sender_name", "") or "").strip()
+    return sid[:64], name[:64]
 
 
 def _read_persona_file(arg: str) -> str:
@@ -333,19 +356,25 @@ class MemoryCommitPlugin(Star):
         n = self.failures.note(kind, err)
         logger.warning("[记忆账本] %s: %r（累计 %d 次）" % (kind, err, n))
 
-    def _auto_sink(self) -> dict:
+    def _auto_sink(self, session_id: str = "", speaker_id: str = "",
+                   speaker_name: str = "") -> dict:
         """不依赖模型自觉的沉淀（P0-1，N1 后默认关闭）。
 
         on_llm_response 每完成一轮就记一次；攒够 AUTO_SINK_EVERY 轮就把这几轮
         的原文按规则折成一条 level=day 记忆。只新增，不改已有记忆正文，
         不删原文链。失败不影响回复。
 
+        B1：session_id 非空时只沉这一会话的原文、scope_key 也落到它——
+        多会话各沉各的，原文链按会话过滤。
+        B2：sender_id 非空时把「谁说的」写进 memory_speaker（同一提交）。
+
         N1 降级：默认轮次 0（关）；开启后写出的条目也带 AUTO_SINK_TYPE_TAG
         （type:auto_sink）类型标记，统一标签「自动沉淀」保留，唤起侧按标记
         排除，不许把索引当普通事实注入系统提示。
         N2：两个标记只进 tags 供识别与显式检索（recall 搜「自动沉淀」、
         auto_sink_ids 精确匹配），建图侧被 ledger.is_machine_tag 拦下——
-        沉淀条目不产生任何 concept 边。
+        沉淀条目一条 concept 边也不织，不会把「聊过什么」
+        的索引连成图谱上的语义同源。
         """
         if AUTO_SINK_EVERY <= 0:
             return {}
@@ -353,7 +382,8 @@ class MemoryCommitPlugin(Star):
         if self._turn_since_sink < AUTO_SINK_EVERY:
             return {}
         rows = self.ledger.recent_messages(limit=AUTO_SINK_EVERY * 2,
-                                           after_seq=self._last_sink_seq)
+                                           after_seq=self._last_sink_seq,
+                                           session_id=session_id)
         if not rows:
             return {}
         summary = auto_sink_summary(rows)
@@ -367,7 +397,8 @@ class MemoryCommitPlugin(Star):
             res = self.ledger.remember(
                 summary, level="day",
                 tags="%s,%s" % (AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG),
-                importance=0.45)
+                importance=0.45, scope_key=session_id,
+                speaker_id=speaker_id, speaker_name=speaker_name)
         self._last_sink_seq = max(int(r["seq"]) for r in rows)
         self._turn_since_sink = 0
         return res
@@ -830,8 +861,11 @@ class MemoryCommitPlugin(Star):
         """每次请求大模型前，把此刻「该被想起来」的记忆塞进系统提示。
 
         以前只有写入没有唤起，账本就是单向黑洞；这里补的是最关键的一环。
+
+        B5 门：owner 私聊照旧；非 owner 只有群聊放行（照常记、照常注入，
+        scope 带群号）；非 owner 私聊当场返回，不写、不沉、不注入。
         """
-        if not _is_owner(event):
+        if not _is_owner(event) and not _is_group(event):
             return
         # 原文锚绑在这次请求的事件上（R2），不再挂在插件实例：
         # 不同会话/并发请求各锚各的，不会串；落链失败显式置 0，
@@ -866,9 +900,13 @@ class MemoryCommitPlugin(Star):
         except Exception:
             pass
         raw = (getattr(req, "prompt", "") or "").strip()
+        # 坏感度（B4）：给注入链路的读接口。读失败按 0 处理不阻塞聊天
+        # （get_attitude 内部已吞异常返 0），这一轮先记进注入观测账。
+        speaker_id, _sender_name = _sender_of(event)
+        attitude = self.ledger.get_attitude(speaker_id)
         # 空提示词就什么都不唤起。
         if not raw:
-            self._log_injection("empty_prompt")
+            self._log_injection("empty_prompt", attitude=attitude)
             return
         # 长 prompt 不当检索词（可能是拼好的整段上下文），但流程照常走：
         # 只把 query 置空，让唤起走 fresh 激活路线；导出、换班都不跳过。
@@ -909,8 +947,13 @@ class MemoryCommitPlugin(Star):
             # 条件的记忆按保守处理（不主动浮现），不许编造环境数据。
             scene = (event.unified_msg_origin or "").strip()
             context = {"scene": scene, "now": time.time()} if scene else None
+            # B1：scope_key 落到当前会话——检索、联想、激活都不跨会话；
+            # B3：群聊只注入「关于主人的 public 画像」，owner 私聊给全部
+            # （缺省口径 private，没有可见性行的画像群聊一律不给）。
             result = self.ledger.activate(query, slots=self.INJECT_SLOTS,
-                                          with_profile=with_profile, context=context)
+                                          with_profile=with_profile, context=context,
+                                          scope_key=scene,
+                                          profile_visibility=("public" if _is_group(event) else ""))
             stats: dict = {}
             brief = self.ledger.render_brief(result, max_chars=self.BRIEF_BUDGET,
                                              stats=stats)
@@ -950,7 +993,8 @@ class MemoryCommitPlugin(Star):
         self._log_injection("injected" if brief else "no_hit",
                             query_len=len(query), stats=stats, result=result,
                             long_prompt=long_prompt,
-                            prompt_len=len(raw) if long_prompt else 0)
+                            prompt_len=len(raw) if long_prompt else 0,
+                            attitude=attitude)
         if not brief and not persona:
             return
         if result.get("profiles"):
@@ -961,8 +1005,12 @@ class MemoryCommitPlugin(Star):
 
     @filter.on_llm_response()
     async def record_reply(self, event: AstrMessageEvent, resp) -> None:
-        """把回复的原文接到链尾，再按轮次攒一次自动沉淀。失败不影响回复本身。"""
-        if not _is_owner(event):
+        """把回复的原文接到链尾，再按轮次攒一次自动沉淀。失败不影响回复本身。
+
+        B5 门与 inject_memory 同口径：非 owner 私聊当场返回；非 owner
+        群聊照常落链、照常沉淀（scope 带群号、说话人随沉淀入库）。
+        """
+        if not _is_owner(event) and not _is_group(event):
             return
         try:
             text = (getattr(resp, "completion_text", "") or "").strip()
@@ -972,11 +1020,50 @@ class MemoryCommitPlugin(Star):
         except Exception as e:
             self._note_failure("回复落链失败", e)
             return
-        # 沉淀是锦上添花：它炸了只能计数，绝不能连累回复
+        # 沉淀是锦上添花：它炸了只能计数，绝不能连累回复。
+        # B1/B2：只沉本会话原文，scope 落本会话，发送者随沉淀入库。
+        speaker_id, speaker_name = _sender_of(event)
         try:
-            self._auto_sink()
+            self._auto_sink(session_id=(event.unified_msg_origin or ""),
+                            speaker_id=speaker_id, speaker_name=speaker_name)
         except Exception as e:
             self._note_failure("自动沉淀失败", e)
+
+    @filter.command("坏感度")
+    async def cmd_attitude(self, event: AstrMessageEvent):
+        """坏感度分级（B4）：/坏感度 用户ID 查 | /坏感度 用户ID 0-4 [原因]
+
+        0 正常、4 最低（可不搭理）。手动设置，没有自动降级；主人的等级
+        严禁修改（账本层也拦，这里只是提前给一句人话）。
+        """
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
+        raw = (event.get_message_str() or "").strip()
+        parts = raw.split()
+        if len(parts) < 2:
+            yield event.plain_result(
+                "用法：/坏感度 用户ID → 查；"
+                "/坏感度 用户ID 0到4 [原因] → 设。主人的等级不许设。")
+            return
+        uid = parts[1].strip()
+        if len(parts) == 2:
+            row = self.ledger.get_attitude_detail(uid)
+            reason = "（原因：%s）" % row["reason"] if row["reason"] else "（还没记过）"
+            yield event.plain_result("%s 坏感度 %d%s" % (
+                uid, int(row["level"]), reason))
+            return
+        if uid == ATTITUDE_OWNER_ID:
+            yield event.plain_result("主人的坏感度不许设：owner 的等级严禁修改。")
+            return
+        reason = " ".join(parts[3:]) if len(parts) > 3 else ""
+        try:
+            res = self.ledger.set_attitude(uid, parts[2], reason)
+        except LedgerError as e:
+            yield event.plain_result("没设成：%s" % e)
+            return
+        yield event.plain_result("已把 %s 坏感度设为 %d（提交 %s）" % (
+            uid, res["level"], res["commit"]))
 
     @filter.command("记忆原话")
     async def cmd_raw(self, event: AstrMessageEvent):
@@ -1165,22 +1252,35 @@ class MemoryCommitPlugin(Star):
 
     @filter.llm_tool(name="memory_profile")
     async def memory_profile(self, event: AstrMessageEvent, fact: str,
-                             category: str = "event") -> str:
+                             category: str = "event",
+                             visibility: str = "private") -> str:
         """记下一条关于用户的长期事实（画像层）。同一件事重复提到会累加权重。
 
         Args:
             fact(string): 事实本身，例如「用户怕冷，空调喜欢开 26 度」
             category(string): preference / identity / event / relation / dislike 之一
+            visibility(string): 画像可见性（B3）：private 私密（默认，只有
+                owner 私聊可见）/ public 公开（群聊也能看到关于主人的这条画像）；
+                只有群聊场景允许 public，私聊里一律强制 private
         """
         if not _is_owner(event):
             return "不可用：记忆账本只在用户和助手的私聊里开放。"
+        vis = str(visibility or "private").strip() or "private"
+        if vis not in ("private", "public"):
+            return "没记住：visibility 只能是 private/public，收到：%s" % vis
+        if not _is_group(event):
+            # owner 私聊里抽出的画像事实强制 private（B3）：私聊里说什么
+            # 都是两个人的事，不许因为模型顺手传了 public 就外流。
+            vis = "private"
+        forced = "（私聊画像一律私密）" if str(visibility or "").strip().lower() == "public" else ""
         try:
             cat = str(category or "event").strip() or "event"
             res = self.ledger.remember_profile(
-                "master", _as_text(fact, "事实", limit=200), category=cat)
+                "master", _as_text(fact, "事实", limit=200), category=cat,
+                visibility=vis)
         except LedgerError as e:
             return "没记住：%s" % e
-        return "画像已更新（%s）" % res["profile_id"]
+        return "画像已更新（%s）%s" % (res["profile_id"], forced)
 
     @filter.llm_tool(name="memory_persona")
     async def memory_persona(self, event: AstrMessageEvent, action: str = "list",

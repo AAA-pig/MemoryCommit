@@ -934,13 +934,15 @@ class AccessLogTest(unittest.TestCase):
 
     def test_schema_is_v5(self):
         """v5：梦境与职守五张新表；v6：创作项目旁路表 creative；v7：
-        core_rule 人格分区三列（后续版本断言随结构版本同步，当前 7）。"""
-        self.assertEqual(self.led.schema_version(), 7)
-        self.assertEqual(L.SCHEMA_VERSION, 7)
+        core_rule 人格分区三列；v8：群聊支持三张新表（后续版本断言
+        随结构版本同步，当前 8）。"""
+        self.assertEqual(self.led.schema_version(), 8)
+        self.assertEqual(L.SCHEMA_VERSION, 8)
         names = {r["name"] for r in self.led._conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table'")}
         for tbl in ("memory_condition", "memory_status", "dream_proposal",
-                    "memory_source_anchor", "user_denial", "creative"):
+                    "memory_source_anchor", "user_denial", "creative",
+                    "memory_speaker", "profile_visibility", "user_attitude"):
             self.assertIn(tbl, names)
 
     def test_message_seq_index_created(self):
@@ -1072,7 +1074,7 @@ class AccessLogTest(unittest.TestCase):
 
         led = L.Ledger(path)  # 打开即迁移
         try:
-            self.assertEqual(led.schema_version(), 7)
+            self.assertEqual(led.schema_version(), 8)
             idx = [r["name"] for r in led._conn.execute("PRAGMA index_list(message)")]
             self.assertIn("idx_message_seq", idx,
                           "迁移到 v4 后应补 message 的 seq 索引")

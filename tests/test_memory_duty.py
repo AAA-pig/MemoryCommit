@@ -68,6 +68,14 @@ except ModuleNotFoundError:
 #   的 add_persona，闸与 add_persona 完全同一道——反向守卫 + 通行令牌）。
 #   允许公开的理由：它是用户手写文本的唯一批量入口，粒度是「一次导入」，
 #   不是给自动路径用的。经本轮任务评审入清单。
+# 2026-11-15 v8 群聊支持新增 7 个：写路径 3 个——
+#   set_attitude（/坏感度 的落库口：走提交链，owner 锁死在 builder 层兜底）、
+#   set_profile_visibility（画像可见性手动改口：走提交链，画像行必须存在）、
+#   remember 的新 speaker 参数不算新方法（仍是唯一入库口）。
+#   读路径 4 个——speakers_of / speaker_memories（说话人反查）、
+#   profile_visibility_of（可见性查询，缺行按 private）、
+#   get_attitude / get_attitude_detail（坏感度读取，失败按 0 不阻塞聊天）。
+#   读接口全部无写库。经本轮任务评审入清单。
 LEDGER_PUBLIC_METHODS = frozenset({
     "access_history", "activate", "add_persona", "add_persona_batch", "anchor_memory", "append_message",
     "auto_sink_ids",
@@ -75,18 +83,18 @@ LEDGER_PUBLIC_METHODS = frozenset({
     "denial_history", "denied_ids", "deny_memory", "deny_revoke", "disputed_ids",
     "dream_add_memory",
     "dream_apply", "dream_produced_ids", "dump_jsonl", "export_markdown",
-    "flush", "flush_plan", "forget", "get_creative", "head", "health_check", "history",
+    "flush", "flush_plan", "forget", "get_attitude", "get_attitude_detail", "get_creative", "head", "health_check", "history",
     "list_creatives", "list_persona", "load_jsonl", "materialize", "max_created_seq",
     "max_persona_no", "maybe_checkpoint_wal",
     "maybe_export_daily", "maybe_rebalance_working_set", "message_stats",
     "nominate_node", "pending_denial_queue", "persona_text", "plan_working_set",
-    "profiles",
+    "profile_visibility_of", "profiles",
     "propose_clues", "prune_access_log", "queue_denial_suspect", "quiet_ids",
     "rebalance_working_set", "recall", "recent_messages", "remember",
     "remember_profile", "remove_persona", "render_brief", "reseal_persona_core",
     "restricted_auto_write",
     "schema_version", "search_messages",
-    "set_memory_condition", "set_memory_status", "show_commit", "stats",
+    "set_attitude", "set_memory_condition", "set_memory_status", "set_profile_visibility", "show_commit", "speaker_memories", "speakers_of", "stats",
     "status_timeline", "touch", "touch_many", "trace_to_source", "update_persona",
     "upsert_creative", "user_persona_write",
     "verify_message_chain", "wal_bytes", "working_set",
