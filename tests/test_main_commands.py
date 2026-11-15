@@ -885,13 +885,19 @@ def test_persona_import_file_needs_path(plugin):
     assert "用法" in out
 
 
-def test_persona_import_file_missing(plugin, tmp_path):
-    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % (tmp_path / "nope.txt"))
+def test_persona_import_file_missing(mod, plugin, tmp_path, monkeypatch):
+    pf = tmp_path / "persona_files"
+    pf.mkdir()
+    monkeypatch.setattr(mod, "PERSONA_FILES_DIR", pf)
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % (pf / "nope.txt"))
     assert "没找到文件" in out
 
 
-def test_persona_import_file_ok(plugin, tmp_path):
-    p = tmp_path / "persona.txt"
+def test_persona_import_file_ok(mod, plugin, tmp_path, monkeypatch):
+    pf = tmp_path / "persona_files"
+    pf.mkdir()
+    monkeypatch.setattr(mod, "PERSONA_FILES_DIR", pf)
+    p = pf / "persona.txt"
     p.write_text("# 注释不写\n[80] 从文件来的\n", encoding="utf-8")
     out = _cmd(plugin, "cmd_persona", '/人格 导入文件 "%s"' % p)
     assert "已手写写入 1 条" in out
@@ -899,15 +905,21 @@ def test_persona_import_file_ok(plugin, tmp_path):
     assert rows[0]["content"] == "从文件来的" and rows[0]["priority"] == 80
 
 
-def test_persona_import_file_too_big(plugin, tmp_path):
-    p = tmp_path / "big.txt"
+def test_persona_import_file_too_big(mod, plugin, tmp_path, monkeypatch):
+    pf = tmp_path / "persona_files"
+    pf.mkdir()
+    monkeypatch.setattr(mod, "PERSONA_FILES_DIR", pf)
+    p = pf / "big.txt"
     p.write_bytes(b"x" * (128 * 1024 + 1))
     out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % p)
     assert "128KB" in out
 
 
-def test_persona_import_file_bad_encoding(plugin, tmp_path):
-    p = tmp_path / "gbk.txt"
+def test_persona_import_file_bad_encoding(mod, plugin, tmp_path, monkeypatch):
+    pf = tmp_path / "persona_files"
+    pf.mkdir()
+    monkeypatch.setattr(mod, "PERSONA_FILES_DIR", pf)
+    p = pf / "gbk.txt"
     p.write_bytes("中文".encode("gbk"))
     out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % p)
     assert "读不了" in out
