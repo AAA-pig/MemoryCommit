@@ -64,9 +64,9 @@ class PersonaTest(unittest.TestCase):
     # ---------- 版本号 ----------
 
     def test_versions_bumped(self):
-        self.assertEqual(L.SCHEMA_VERSION, 7)
-        self.assertEqual(L.DUMP_VERSION, 5)
-        self.assertEqual(self.led.schema_version(), 7)
+        self.assertEqual(L.SCHEMA_VERSION, 8)
+        self.assertEqual(L.DUMP_VERSION, 6)
+        self.assertEqual(self.led.schema_version(), 8)
 
     # ---------- 增删改查 ----------
 
@@ -281,19 +281,19 @@ class PersonaTest(unittest.TestCase):
 
     # ---------- 备份：v5 往返 / v4 兼容 ----------
 
-    def test_dump_v5_roundtrip(self):
+    def test_dump_v6_roundtrip(self):
         self.led._seed_persona_core([{"content": "身份：助手", "priority": 100}])
         self.led.add_persona("self", "喜欢简洁", priority=10, source="test")
         dump_path = os.path.join(self.tmp, "dump.jsonl")
         text = self.led.dump_jsonl(dump_path)
         header = json.loads(text.splitlines()[0])
-        self.assertEqual(header["version"], 5)
-        self.assertEqual(header["schema_version"], 7)
+        self.assertEqual(header["version"], 6)
+        self.assertEqual(header["schema_version"], 8)
         led2 = L.Ledger(os.path.join(self.tmp, "rt.db"))
         try:
             res = led2.load_jsonl(dump_path)
             self.assertGreater(res["written"], 0)
-            self.assertEqual(led2.schema_version(), 7)
+            self.assertEqual(led2.schema_version(), 8)
             core = led2.list_persona("core")
             self.assertEqual(len(core), 1)
             self.assertEqual(core[0]["content"], "身份：助手")
@@ -315,11 +315,12 @@ class PersonaTest(unittest.TestCase):
             obj = json.loads(ln)
             if obj.get("t") == "__eof__":
                 break
-            # v4 时代没有 creative / 沉淀等 v5+ 结构，只保留 v4 就有的表
+            # v4 时代没有 creative / 沉淀 / v8 群聊三表等 v5+ 结构，只保留 v4 就有的表
             if obj.get("t") in ("meta", "core_rule", "creative", "access_log",
                                 "memory_condition", "memory_status",
                                 "dream_proposal", "memory_source_anchor",
-                                "user_denial"):
+                                "user_denial", "memory_speaker",
+                                "profile_visibility", "user_attitude"):
                 continue
             body.append(obj)
         counts = {}
@@ -340,7 +341,7 @@ class PersonaTest(unittest.TestCase):
         try:
             res = led2.load_jsonl(v4_path)
             self.assertGreater(res["written"], 0)
-            self.assertEqual(led2.schema_version(), 7)
+            self.assertEqual(led2.schema_version(), 8)
             self.assertEqual(len(led2.list_persona()), 0)
         finally:
             led2.close()
@@ -374,14 +375,14 @@ class PersonaTest(unittest.TestCase):
             led2.close()
 
     def test_v5_backup_rejected_by_v4_semantics(self):
-        """v5 备份旧代码（DUMP_VERSION=4）必须在文件头拒收——用常量推演。"""
+        """v6 备份旧代码（DUMP_VERSION=5）必须在文件头拒收——用常量推演。"""
         self.led.dump_jsonl(os.path.join(self.tmp, "d.jsonl"))
         text = open(os.path.join(self.tmp, "d.jsonl"), encoding="utf-8").read()
         header = json.loads(text.splitlines()[0])
-        # 新备份 header 是 v5
-        self.assertEqual(header["version"], 5)
+        # 新备份 header 是 v6
+        self.assertEqual(header["version"], 6)
         # 旧代码的拒收条件：version > 旧 DUMP_VERSION
-        old_dump_version = 4
+        old_dump_version = 5
         self.assertGreater(header["version"], old_dump_version)
 
     # ---------- 迁移 6→7 ----------
@@ -391,7 +392,7 @@ class PersonaTest(unittest.TestCase):
         _make_v6_db(path)
         led2 = L.Ledger(path)
         try:
-            self.assertEqual(led2.schema_version(), 7)
+            self.assertEqual(led2.schema_version(), 8)
             rows = led2.list_persona()
             self.assertEqual(len(rows), 1)
             row = rows[0]
@@ -416,8 +417,8 @@ class PersonaTest(unittest.TestCase):
 
     def test_migrate_is_idempotent(self):
         """新库（SCHEMA_STATEMENTS 已带三列）从版本 0 全链迁移不炸重列。"""
-        # setUp 里建的库就是这条路径：SCHEMA_STATEMENTS 建表 → 0→7 迁移
-        self.assertEqual(self.led.schema_version(), 7)
+        # setUp 里建的库就是这条路径：SCHEMA_STATEMENTS 建表 → 0→8 迁移
+        self.assertEqual(self.led.schema_version(), 8)
         cols = [r["name"] for r in self.led._query_all(
             "PRAGMA table_info(core_rule)")]
         self.assertEqual(cols, ["id", "content", "priority", "created_at",

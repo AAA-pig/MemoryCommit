@@ -53,9 +53,10 @@ class CreativeTableTest(unittest.TestCase):
     # ---------- schema ----------
 
     def test_fresh_db_creates_creative_table(self):
-        """新库自动建出 creative 表，结构版本升到 7（v6 加表、v7 加人格分区）。"""
+        """新库自动建出 creative 表，结构版本升到 8（v6 加表、v7 加人格分区、
+        v8 加群聊三表）。"""
         led = self._open()
-        self.assertEqual(led.schema_version(), 7)
+        self.assertEqual(led.schema_version(), 8)
         rows = led._query_all(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='creative'")
         self.assertTrue(rows, "新库没建 creative 表")
@@ -71,8 +72,8 @@ class CreativeTableTest(unittest.TestCase):
             cx.execute("UPDATE meta SET v='5' WHERE k='schema_version'")
         cx.close()
 
-        led2 = self._open()                      # 重新打开 → 走 5→6→7 迁移
-        self.assertEqual(led2.schema_version(), 7)
+        led2 = self._open()                      # 重新打开 → 走 5→6→7→8 迁移
+        self.assertEqual(led2.schema_version(), 8)
         self.assertTrue(led2.get_creative("proj01") is None)  # 表已在，可读
         led2.upsert_creative("proj01", "补建之后写第一条")     # 可写
         row = led2.get_creative("proj01")

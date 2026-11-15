@@ -59,14 +59,24 @@ log = logging.getLogger(__name__)
 #     存量行 kind 落默认 'self'，不伪造任何 core 行——基础设定只能由
 #     显式播种（_seed_persona_core）产生。kind='core' 的行只读，
 #     写路径一律 LedgerError，唯一例外走内部参数 _allow_core=True。
-SCHEMA_VERSION = 7
+# v8：群聊支持三张新表（2026-11-15）。memory_speaker（记忆↔说话人）/
+#     profile_visibility（画像可见性）/ user_attitude（坏感度）。照 v5/v6
+#     先例纯加法：memory 主表一行一列不动，全部新表 + 引用，
+#     CREATE TABLE IF NOT EXISTS 老库升上来建表。前两张进提交链
+#     （可回溯），user_attitude 是手动设置的用户数据，也走提交链。
+SCHEMA_VERSION = 8
 
 # 给宿主看的接口版本。公开方法的签名/返回结构变了才 +1，跟表结构是两件事：
 # 换了个内核但数据没动，只该动这个；数据加了列，只该动上面那个。
 # v2：新增否认/状态/锚/分类/梦骨架等公开方法，stats() 返回结构补键（向后兼容追加）。
 # v3（2026-11-15）：新增人格分区公开方法（add/update/remove/list_persona、
 #     persona_text、reseal_persona_core），core_rule 行新增 kind/source/updated_at。
-CORE_API_VERSION = 3
+# v4（2026-11-15）：群聊支持公开方法：speakers_of / speaker_memories（说话人
+#     反查）、remember 的 speaker 参数、profile_visibility 三件套（写入/
+#     查询/设置）、profiles 的 visibility 过滤、activate 的 profile_visibility
+#     参数、set_attitude / get_attitude（坏感度）、recent_messages 的
+#     session_id 参数。
+CORE_API_VERSION = 4
 
 # 可往返导出的文件：格式名 + 文件自身版本（排版变了才 +1）
 # v2（R5）：文件头带每表行数清单与总行数，尾部加 __eof__ 标记；
@@ -84,8 +94,12 @@ CORE_API_VERSION = 3
 # 新库上的人格就不完整。破坏性变更同 v4 先例：v5 备份旧代码在文件头
 # 拒收（「备份格式 v5 比当前支持的 v4 新」）；v4 及以下老备份没有三列，
 # 新代码照收，列落默认值（kind='self'）。
+# v6（2026-11-15）：群聊支持三张表随备份走（schema v8）。说话人丢了
+# 「谁说的」就没法反查，画像可见性丢了注入口径会翻车，坏感度丢了
+# 分级白记；v6 备份旧代码在文件头拒收，v5 及以下老备份没有三张表，
+# 新代码照收——替换式恢复时本地这三张表原样保留（照 creative 先例）。
 DUMP_FORMAT = "jj-memory-dump"
-DUMP_VERSION = 5
+DUMP_VERSION = 6
 
 # 搬家时要带走的表，顺序按「先元信息、后投影」，导入时不会因为顺序互相绊住
 DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
@@ -101,7 +115,15 @@ DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
                 "access_log",
                 # v4/v6（2026-11-15）：creative 是创作项目正文与原始档，
                 # 搬家丢表就是丢作品，必须带走。
-                "creative")
+                "creative",
+                # v8（2026-11-15）：群聊支持三张表。说话人/可见性都在提交链上，
+                # 坏感度是手动设置的用户数据；搬家丢表=丢「谁说的、什么口径、
+                # 什么态度」，必须带走。
+                "memory_speaker", "profile_visibility", "user_attitude")
+
+# v8 群聊三表的表名清单：备份兼容判断用（旧备份不带这三张表时，
+# 替换式恢复不许把它们清掉）
+V8_DUMP_TABLES = ("memory_speaker", "profile_visibility", "user_attitude")
 
 # 每张表导出时的稳定排序，纯粹为了 diff 好看，往返不依赖顺序
 _DUMP_ORDER = {
@@ -122,6 +144,9 @@ _DUMP_ORDER = {
     "user_denial": "id",
     "access_log": "id",
     "creative": "created_at, id",
+    "memory_speaker": "memory_id, speaker_id",
+    "profile_visibility": "profile_id",
+    "user_attitude": "user_id",
 }
 
 # meta 里属于「这台机器此刻的状态」而不属于「账本内容」的键，导出时跳过
@@ -377,6 +402,31 @@ SCHEMA_STATEMENTS = (
         updated_at TEXT NOT NULL,
         created_seq INTEGER NOT NULL DEFAULT 0)""",
     "CREATE INDEX IF NOT EXISTS idx_creative_seq ON creative(created_seq)",
+    # v8 · 群聊支持三张表（2026-11-15）。照 v5/v6 先例：DDL 与
+    # _migrate_7_to_8 各重复一份；memory 主表一行一列不动。
+    # 1. 记忆↔说话人：谁说的（进提交链，可回溯）。一条记忆可以有多个
+    #    说话人（群聊沉淀一条里可能提多个人），行主键是 (memory_id, speaker_id)。
+    """CREATE TABLE IF NOT EXISTS memory_speaker (
+        memory_id TEXT NOT NULL,
+        speaker_id TEXT NOT NULL,
+        speaker_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (memory_id, speaker_id))""",
+    "CREATE INDEX IF NOT EXISTS idx_speaker_id ON memory_speaker(speaker_id)",
+    # 2. 画像可见性：owner 私聊抽出的画像事实 private，群聊可为 public。
+    #    缺行一律按 private 处理（保守），读侧不 join 也不炸。
+    """CREATE TABLE IF NOT EXISTS profile_visibility (
+        profile_id TEXT PRIMARY KEY,
+        visibility TEXT NOT NULL DEFAULT 'private'
+            CHECK (visibility IN ('private','public')),
+        updated_at TEXT NOT NULL)""",
+    # 3. 坏感度分级：0 正常、4 最低。与画像彻底分开存，owner（master）
+    #    的行写路径一律拒绝（见 ATTITUDE_OWNER_ID）。
+    """CREATE TABLE IF NOT EXISTS user_attitude (
+        user_id TEXT PRIMARY KEY,
+        level INTEGER NOT NULL DEFAULT 0 CHECK (level BETWEEN 0 AND 4),
+        reason TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL)""",
 )
 
 DEFAULT_META = {
@@ -390,6 +440,15 @@ DEFAULT_META = {
     "message_head": "",
     "persona_no": "0",
 }
+
+# 坏感度表里 owner 的身分（v8）：画像层对主人的 user_id 固定用这个字面
+# （main.memory_profile 写死），坏感度写路径遇到它一律拒绝——owner 的
+# 等级严禁修改，门面层与 builder 层都拦，没有旁路。
+ATTITUDE_OWNER_ID = "master"
+
+# 画像可见性（v8）的合法取值。缺行按 private 处理（保守），只在显式
+# 说 public 时才对群聊可见。
+PROFILE_VISIBILITIES = ("private", "public")
 
 # 人格分区（v7）：core_rule.kind 的合法取值。
 # self = 可编辑人格设定（add_persona 默认分区）；core = 只读基础设定，
@@ -653,9 +712,39 @@ def _migrate_6_to_7(led: "Ledger", cx: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_7_to_8(led: "Ledger", cx: sqlite3.Connection) -> None:
+    """7 → 8：群聊支持三张新表（2026-11-15）。
+
+    照 v4_to_5 先例：DDL 与 SCHEMA_STATEMENTS 重复一份，
+    CREATE TABLE IF NOT EXISTS，老库升上来建表，新库建表语句早已生效。
+    纯加法：memory 主表一行一列不动，存量数据不动。
+    """
+    for stmt in (
+        """CREATE TABLE IF NOT EXISTS memory_speaker (
+            memory_id TEXT NOT NULL,
+            speaker_id TEXT NOT NULL,
+            speaker_name TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (memory_id, speaker_id))""",
+        "CREATE INDEX IF NOT EXISTS idx_speaker_id ON memory_speaker(speaker_id)",
+        """CREATE TABLE IF NOT EXISTS profile_visibility (
+            profile_id TEXT PRIMARY KEY,
+            visibility TEXT NOT NULL DEFAULT 'private'
+                CHECK (visibility IN ('private','public')),
+            updated_at TEXT NOT NULL)""",
+        """CREATE TABLE IF NOT EXISTS user_attitude (
+            user_id TEXT PRIMARY KEY,
+            level INTEGER NOT NULL DEFAULT 0 CHECK (level BETWEEN 0 AND 4),
+            reason TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL)""",
+    ):
+        cx.execute(stmt)
+    return None
+
+
 _MIGRATIONS = {0: _migrate_0_to_1, 1: _migrate_1_to_2, 2: _migrate_2_to_3,
                3: _migrate_3_to_4, 4: _migrate_4_to_5, 5: _migrate_5_to_6,
-               6: _migrate_6_to_7}
+               6: _migrate_6_to_7, 7: _migrate_7_to_8}
 
 
 # memory 表里这俩列不是「记忆内容」，是「记忆被翻过多少次」的缓存。
@@ -671,6 +760,10 @@ PROJECTIONS = {
     "memory_link": lambda r: "%s|%s|%s" % (r.get("from_id"), r.get("to_id"), r.get("concept")),
     "profile": lambda r: r.get("id"),
     "core_rule": lambda r: r.get("id"),
+    # v8：群聊支持三张表进提交链，回放/压缩/对账同样要认得它们
+    "memory_speaker": lambda r: "%s|%s" % (r.get("memory_id"), r.get("speaker_id")),
+    "profile_visibility": lambda r: r.get("profile_id"),
+    "user_attitude": lambda r: r.get("user_id"),
 }
 
 STOPWORDS = {
@@ -1755,6 +1848,121 @@ class CommitBuilder:
                     "weight": int(weight), "updated_at": ts})
         return pid
 
+    # -- 群聊支持（v8）--
+
+    def _find_v8_row(self, tbl: str, where: Dict[str, Any]
+                     ) -> Optional[Dict[str, Any]]:
+        """本提交或库里找一行 v8 投影行：先扫本提交，再查库（persona 先例）。"""
+        for r in reversed(self.rows):
+            if (r["tbl"] == tbl and r["op"] != "delete"
+                    and all(r["where"].get(k) == v for k, v in where.items())):
+                return r["after"]
+        conds = " AND ".join("%s = ?" % k for k in where)
+        row = self.ledger._query_one(
+            "SELECT * FROM %s WHERE %s" % (tbl, conds), tuple(where.values()))
+        return dict(row) if row else None
+
+    def add_speaker(self, memory_id: str, speaker_id: str,
+                    speaker_name: str = "") -> Optional[str]:
+        """记下一条记忆的说话人（B2）。空 speaker_id 不写行，返回 None。
+
+        同一 (memory_id, speaker_id) 已有行就更新名字（upsert），不会重复。
+        speaker_name 只是显示名，超 64 字截断；speaker_id 超长是调用方 bug，
+        显式失败。进提交链：删了记忆也能从历史里翻出「当时谁说的」。
+        """
+        if not memory_id:
+            raise LedgerError("add_speaker 需要记忆 id")
+        speaker_id = (speaker_id or "").strip()
+        if not speaker_id:
+            return None
+        if len(speaker_id) > 64:
+            raise LedgerError("speaker_id 超过 64 字上限")
+        speaker_name = " ".join(str(speaker_name or "").split())[:64]
+        where = {"memory_id": memory_id, "speaker_id": speaker_id}
+        ts = now_str()
+        snap = self._find_v8_row("memory_speaker", where)
+        if snap:
+            after = dict(snap)
+            after["speaker_name"] = speaker_name
+            after["created_at"] = after.get("created_at") or ts
+            self._push("memory_speaker", "update", dict(where),
+                       {"speaker_name": snap.get("speaker_name", ""),
+                        "created_at": after["created_at"]}, after)
+            return speaker_id
+        self._push("memory_speaker", "insert", dict(where), None,
+                   {"memory_id": memory_id, "speaker_id": speaker_id,
+                    "speaker_name": speaker_name, "created_at": ts})
+        return speaker_id
+
+    def _find_profile(self, profile_id: str) -> Optional[Dict[str, Any]]:
+        """本提交或库里找一行画像（visibility 同提交落地时查库查不到）。"""
+        for r in reversed(self.rows):
+            if (r["tbl"] == "profile" and r["op"] != "delete"
+                    and r["where"].get("id") == profile_id):
+                return r["after"]
+        row = self.ledger._query_one(
+            "SELECT * FROM profile WHERE id = ?", (profile_id,))
+        return dict(row) if row else None
+
+    def set_profile_visibility(self, profile_id: str, visibility: str) -> str:
+        """设置一条画像事实的可见性（B3）。upsert；画像行必须存在。"""
+        visibility = (visibility or "").strip()
+        if visibility not in PROFILE_VISIBILITIES:
+            raise LedgerError(
+                "visibility 只支持 private/public，收到：%r" % (visibility,))
+        if not profile_id or self._find_profile(profile_id) is None:
+            raise LedgerError("没有这条画像：%s" % profile_id)
+        where = {"profile_id": profile_id}
+        ts = now_str()
+        snap = self._find_v8_row("profile_visibility", where)
+        if snap:
+            after = dict(snap)
+            after["visibility"] = visibility
+            after["updated_at"] = ts
+            self._push("profile_visibility", "update", dict(where),
+                       {"visibility": snap.get("visibility", "private"),
+                        "updated_at": snap.get("updated_at", "")}, after)
+        else:
+            self._push("profile_visibility", "insert", dict(where), None,
+                       {"profile_id": profile_id, "visibility": visibility,
+                        "updated_at": ts})
+        return visibility
+
+    def set_attitude(self, user_id: str, level: int, reason: str = "") -> int:
+        """设置一个人的坏感度等级（B4）。0 正常、4 最低；owner 锁死。"""
+        user_id = (user_id or "").strip()
+        if not user_id:
+            raise LedgerError("user_id 不能为空")
+        if len(user_id) > 64:
+            raise LedgerError("user_id 超过 64 字上限")
+        if user_id == ATTITUDE_OWNER_ID:
+            raise LedgerError(
+                "主人（%s）的坏感度严禁修改：set_attitude 拒绝" % ATTITUDE_OWNER_ID)
+        try:
+            level = int(level)
+        except (TypeError, ValueError):
+            raise LedgerError("坏感度等级必须是 0-4 的整数，收到：%r" % (level,))
+        if not 0 <= level <= 4:
+            raise LedgerError("坏感度等级只能是 0-4，收到：%d" % level)
+        reason = " ".join(str(reason or "").split())[:200]
+        where = {"user_id": user_id}
+        ts = now_str()
+        snap = self._find_v8_row("user_attitude", where)
+        if snap:
+            after = dict(snap)
+            after["level"] = level
+            after["reason"] = reason
+            after["updated_at"] = ts
+            self._push("user_attitude", "update", dict(where),
+                       {"level": int(snap.get("level", 0)),
+                        "reason": snap.get("reason", ""),
+                        "updated_at": snap.get("updated_at", "")}, after)
+        else:
+            self._push("user_attitude", "insert", dict(where), None,
+                       {"user_id": user_id, "level": level, "reason": reason,
+                        "updated_at": ts})
+        return level
+
     def seal(self) -> str:
         if self._sealed:
             raise LedgerError("这个提交已经封过了")
@@ -2549,7 +2757,8 @@ class Ledger:
     def remember(self, summary: str, level: str = "day", tags: Any = "",
                  importance: float = 0.5, grade: int = 1, scope_key: str = "",
                  start_time: str = "", end_time: str = "",
-                 anchor_seq: int = 0) -> Dict[str, Any]:
+                 anchor_seq: int = 0, speaker_id: str = "",
+                 speaker_name: str = "") -> Dict[str, Any]:
         # summary 可能是 None / 数字：这里是唯一的入库口，先收干净再谈别的，
         # 否则 .strip() 直接 AttributeError，工具调用整条炸掉。
         summary = "" if summary is None else str(summary).strip()
@@ -2560,6 +2769,10 @@ class Ledger:
         mid = builder.add_memory(summary, level=level, tags=tags, importance=importance,
                                  grade=grade, scope_key=scope_key,
                                  start_time=start_time, end_time=end_time)
+        # 说话人（B2）：同一提交落地，可回溯。空 speaker_id（拿不到发送者）
+        # 不写行，builder.add_speaker 自己会跳过。
+        if (speaker_id or "").strip():
+            builder.add_speaker(mid, speaker_id, speaker_name)
         # 增量原文锚（v5）：anchor_seq 传本轮用户消息的链上序号，锚与记忆
         # 同事务落地（builder._extra_tx）。0 = 不锚；负数是调用方传错了，
         # 显式失败（不编锚）。存量记忆没有锚也不编——trace_to_source 查不到就返回空。
@@ -2575,6 +2788,26 @@ class Ledger:
             builder._extra_tx = _anchor
         builder.seal()
         return {"commit": self.head(), "memory_id": mid}
+
+    def speakers_of(self, memory_id: str) -> List[Dict[str, Any]]:
+        """反查：一条记忆是谁说的（B2 读取侧）。"""
+        return [dict(r) for r in self._query_all(
+            "SELECT * FROM memory_speaker WHERE memory_id = ?"
+            " ORDER BY speaker_id", ((memory_id or "").strip(),))]
+
+    def speaker_memories(self, speaker_id: str,
+                         limit: int = 20) -> List[Dict[str, Any]]:
+        """反查：某个人说过的话都沉进了哪些记忆（B2 读取侧），新的在前。"""
+        sid = (speaker_id or "").strip()
+        if not sid:
+            return []
+        return [dict(r) for r in self._query_all(
+            "SELECT ms.memory_id, ms.speaker_id, ms.speaker_name,"
+            " m.summary, m.created_seq FROM memory_speaker ms"
+            " JOIN memory m ON m.id = ms.memory_id"
+            " WHERE ms.speaker_id = ?"
+            " ORDER BY m.created_seq DESC LIMIT ?",
+            (sid, max(1, int(limit))))]
 
     def recall(self, query: str = "", limit: int = 5, scope_key: str = "",
                touch: bool = True, expand: bool = True,
@@ -2852,7 +3085,8 @@ class Ledger:
                  user_id: str = "master", cooldown_min: float = 25.0,
                  with_profile: bool = True,
                  dry_run: bool = False,
-                 context: Optional[dict] = None) -> Dict[str, Any]:
+                 context: Optional[dict] = None,
+                 profile_visibility: str = "") -> Dict[str, Any]:
         """聊天前的一次「唤起」。
 
         四条路依次补位（route 的真实取值写在括号里，别再另起一套名字）：
@@ -2866,9 +3100,17 @@ class Ledger:
         slots 是「这一轮最多说出口几条」，只影响注入，不影响谁留在工作记忆里。
         context 是当前语境（会话场景、当前时间等，R3）：coexist 记忆只在
         条件判定为匹配时放行；传 None 时判不出条件，coexist 全部保守拦。
+        profile_visibility（B3）："" 全给（owner 私聊口径），"public" 只给
+        「关于主人的 public 画像」（群聊口径，缺行按 private 一律拦），
+        其他值显式拒绝——注入口径不许猜。
         """
         query = (query or "").strip()
         slots = normalize_limit(slots, DEFAULT_INJECT_SLOTS)
+        profile_vis = (profile_visibility or "").strip()
+        if with_profile and profile_vis and profile_vis != "public":
+            raise LedgerError(
+                "profile_visibility 只支持空（全部）或 public，收到：%r"
+                % (profile_vis,))
         cooldown = max(0.0, float(cooldown_min)) * 60.0
         now = time.time()
         picked: List[Dict[str, Any]] = []
@@ -3029,8 +3271,13 @@ class Ledger:
                         break
                 if len(flashes) >= 4:
                     break
+        if with_profile:
+            profile_rows = self.profiles(
+                user_id, limit=3, visibility=profile_vis)
+        else:
+            profile_rows = []
         return {"items": picked,
-                "profiles": self.profiles(user_id, limit=3) if with_profile else [],
+                "profiles": profile_rows,
                 "flashes": flashes,
                 "route": routes[0] if routes else "none",
                 "query": query}
@@ -3127,20 +3374,101 @@ class Ledger:
         return {"commit": self.head(), "memory_id": memory_id}
 
     def remember_profile(self, user_id: str, fact: str,
-                         category: str = "event", weight: int = 1) -> Dict[str, str]:
+                         category: str = "event", weight: int = 1,
+                         visibility: str = "") -> Dict[str, str]:
+        """写画像事实（B3）。visibility 非空时同提交落 profile_visibility 行。
+
+        缺省不写可见性行：读侧对缺行一律按 private 处理（保守），
+        所以不传和传 private 行为一致；只有明确说 public 才对群聊可见。
+        """
+        vis = (visibility or "").strip()
+        if vis and vis not in PROFILE_VISIBILITIES:
+            raise LedgerError(
+                "visibility 只支持 private/public，收到：%r" % (visibility,))
         with self.commit("画像：%s" % fact.strip()[:20]) as c:
             pid = c.upsert_profile(user_id, fact, category=category, weight=weight)
+            if vis:
+                c.set_profile_visibility(pid, vis)
         return {"commit": self.head(), "profile_id": pid}
 
-    def profiles(self, user_id: str = "", limit: int = 30) -> List[Dict[str, Any]]:
-        if user_id:
-            rows = self._query_all(
-                "SELECT * FROM profile WHERE user_id = ? ORDER BY weight DESC, updated_at DESC"
-                " LIMIT ?", (user_id, max(1, limit)))
+    def set_profile_visibility(self, profile_id: str,
+                               visibility: str) -> Dict[str, str]:
+        """手动改一条画像的可见性（B3）。走提交链。"""
+        with self.commit("画像可见性：%s" % profile_id) as c:
+            vis = c.set_profile_visibility(profile_id, visibility)
+        return {"commit": self.head(), "profile_id": profile_id,
+                "visibility": vis}
+
+    def profile_visibility_of(self, profile_id: str) -> str:
+        """查一条画像的可见性。缺行按 private 处理（保守，B3 默认口径）。"""
+        row = self._query_one(
+            "SELECT visibility FROM profile_visibility WHERE profile_id = ?",
+            ((profile_id or "").strip(),))
+        return row["visibility"] if row else "private"
+
+    def profiles(self, user_id: str = "", limit: int = 30,
+                 visibility: str = "") -> List[Dict[str, Any]]:
+        """查画像。visibility='public' 时只给群聊可见的那部分（B3 注入口径）。
+
+        缺可见性行的画像按 private 处理：LEFT JOIN 过滤后天然被排除。
+        """
+        vis = (visibility or "").strip()
+        if vis and vis != "public":
+            raise LedgerError("visibility 只支持空（全部）或 public，收到：%r" % vis)
+        lim = max(1, int(limit))
+        if vis == "public":
+            if user_id:
+                rows = self._query_all(
+                    "SELECT p.* FROM profile p LEFT JOIN profile_visibility pv"
+                    " ON pv.profile_id = p.id"
+                    " WHERE pv.visibility = 'public' AND p.user_id = ?"
+                    " ORDER BY p.weight DESC, p.updated_at DESC LIMIT ?",
+                    (user_id, lim))
+            else:
+                rows = self._query_all(
+                    "SELECT p.* FROM profile p LEFT JOIN profile_visibility pv"
+                    " ON pv.profile_id = p.id"
+                    " WHERE pv.visibility = 'public'"
+                    " ORDER BY p.weight DESC, p.updated_at DESC LIMIT ?", (lim,))
         else:
-            rows = self._query_all(
-                "SELECT * FROM profile ORDER BY weight DESC LIMIT ?", (max(1, limit),))
+            if user_id:
+                rows = self._query_all(
+                    "SELECT * FROM profile WHERE user_id = ?"
+                    " ORDER BY weight DESC, updated_at DESC LIMIT ?",
+                    (user_id, lim))
+            else:
+                rows = self._query_all(
+                    "SELECT * FROM profile ORDER BY weight DESC LIMIT ?", (lim,))
         return [dict(r) for r in rows]
+
+    def set_attitude(self, user_id: str, level: int,
+                     reason: str = "") -> Dict[str, Any]:
+        """设置一个人的坏感度（B4）：0 正常、4 最低。走提交链，owner 锁死。"""
+        with self.commit("坏感度：%s → %s" % (
+                (user_id or "").strip()[:24], level)) as c:
+            lv = c.set_attitude(user_id, level, reason)
+        return {"commit": self.head(), "user_id": (user_id or "").strip(),
+                "level": lv}
+
+    def get_attitude_detail(self, user_id: str) -> Dict[str, Any]:
+        """读一个人的坏感度详情（level/reason/updated_at），给查询命令用。
+
+        读失败按 0 处理不阻塞聊天：没行、库坏了、参数烂了都返回 level=0
+        的空档。写路径才是显式失败的地方。
+        """
+        uid = (user_id or "").strip()
+        empty = {"user_id": uid, "level": 0, "reason": "", "updated_at": ""}
+        try:
+            row = self._query_one(
+                "SELECT user_id, level, reason, updated_at FROM user_attitude"
+                " WHERE user_id = ?", (uid,))
+            return dict(row) if row else empty
+        except Exception:
+            return empty
+
+    def get_attitude(self, user_id: str) -> int:
+        """读一个人的坏感度等级（B4 给注入链路用）。读失败按 0 处理。"""
+        return int(self.get_attitude_detail(user_id)["level"])
 
     # -- 工作记忆 --
 
@@ -3181,15 +3509,22 @@ class Ledger:
             cx.execute("UPDATE meta SET v=? WHERE k='message_head'", (digest,))
         return {"id": mid, "seq": n, "digest": digest}
 
-    def recent_messages(self, limit: int = 20, after_seq: int = 0
-                        ) -> List[Dict[str, Any]]:
+    def recent_messages(self, limit: int = 20, after_seq: int = 0,
+                        session_id: str = "") -> List[Dict[str, Any]]:
         """取最近若干条原文（seq 严格大于 after_seq），按时间正序返回。
 
         给「自动沉淀」用：只读原文链，不参与提交链。
+        session_id 非空时只取该会话的原文（B1：多会话各沉各的，
+        message 表本就有 session_id 列）。
         """
-        rows = self._query_all(
-            "SELECT seq, role, content, at FROM message WHERE seq > ?"
-            " ORDER BY seq DESC LIMIT ?", (int(after_seq or 0), max(1, int(limit))))
+        sql = ("SELECT seq, role, content, at FROM message WHERE seq > ?")
+        params: List[Any] = [int(after_seq or 0)]
+        if session_id:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY seq DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        rows = self._query_all(sql, tuple(params))
         return [dict(r) for r in reversed(rows)]
 
     def search_messages(self, query: str = "", limit: int = 10,
@@ -4434,14 +4769,28 @@ class Ledger:
         # 那是正文，提交链里重放不出来。所以清空只清「备份真的带来」的表：
         # 备份没带 creative，本地创作原样保留，并在 warnings 里如实报数。
         backup_schema = int(header.get("schema_version") or 0)
-        creative_in_backup = "creative" in (header.get("tables") or {})
+        backup_tables = header.get("tables") or {}
+        creative_in_backup = "creative" in backup_tables
         local_creative = self._query_one(
             "SELECT COUNT(*) AS n FROM creative")["n"]
+        # v8 保护（2026-11-15）：群聊三张表进了 DUMP_TABLES，同 creative 先例
+        # ——旧备份（格式 ≤ v5）没带这三张表，替换式恢复不许把它们静默清掉：
+        # 说话人/可见性/坏感度是「谁说的、什么口径、什么态度」。本地行数
+        # 在 warnings 里如实报数。
+        v8_kept: Dict[str, int] = {}
+        for tbl in V8_DUMP_TABLES:
+            if tbl in backup_tables:
+                continue
+            n = self._query_one("SELECT COUNT(*) AS n FROM %s" % tbl)["n"]
+            if n:
+                v8_kept[tbl] = n
 
         with self._tx() as cx:
             if replace:
                 for tbl in reversed(DUMP_TABLES):
                     if tbl == "creative" and not creative_in_backup:
+                        continue
+                    if tbl in V8_DUMP_TABLES and tbl not in backup_tables:
                         continue
                     cx.execute("DELETE FROM %s" % tbl)
             written, dropped_cols = self._write_dump_rows(cx, rows)
@@ -4464,6 +4813,13 @@ class Ledger:
             else:
                 warnings.append(
                     "备份不含 creative 表（结构 %s），本次导入未涉及创作项目" % ver)
+        # v8（2026-11-15）：旧备份没带群聊三张表时的同款报数（replace 才碰清空）
+        if replace and v8_kept:
+            kept_desc = "、".join("%s %d 行" % (t, n)
+                                  for t, n in sorted(v8_kept.items()))
+            warnings.append(
+                "备份不含 v8 群聊表（结构 v%s），本地已保留：%s"
+                % (backup_schema or "未知", kept_desc))
         head = self.head()
         if head and not self.show_commit(head):
             warnings.append("HEAD %s 在提交表里找不到" % head)
