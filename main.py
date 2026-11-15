@@ -140,9 +140,12 @@ def _sender_of(event) -> tuple:
 def _read_persona_file(arg: str) -> str:
     """从人格资料目录读一个手写人格文件，返回文件内容。
 
-    路径边界四道闸（A1）：NUL、软链接、越界、目录。规则是先把
-    resolve() 后的真实路径对进 PERSONA_FILES_DIR，再谈读不读——
-    参数是用户发来的，不能拿它去摸插件目录之外的任何东西。
+    路径边界六道闸（A1/C1）：NUL、软链接、越界、非普通文件、
+    128KB 上限、UTF-8 解码失败。相对路径一律按 PERSONA_FILES_DIR
+    解析（C1：命令提示用户只给文件名，按进程 CWD 找等于坏的）；
+    绝对路径保持原样。规则是先把 resolve(strict=True) 后的真实路径
+    对进 PERSONA_FILES_DIR，再谈读不读——参数是用户发来的，不能拿
+    它去摸插件目录之外的任何东西。
     所有拒绝都转成 LedgerError 的人话，不抛未捕获异常。
     """
     raw = str(arg or "").strip().strip('"').strip("'")
@@ -151,17 +154,23 @@ def _read_persona_file(arg: str) -> str:
     if "\x00" in raw:
         raise LedgerError("路径里有非法字符（NUL），不读")
     path = Path(raw)
-    if path.is_symlink():
-        raise LedgerError("软链接不读：%s" % path)
     base = PERSONA_FILES_DIR.resolve()
-    real = path.resolve()
+    candidate = path if path.is_absolute() else base / path
+    if candidate.is_symlink():
+        raise LedgerError("软链接不读：%s" % candidate)
+    try:
+        real = candidate.resolve(strict=True)
+    except FileNotFoundError:
+        raise LedgerError("没找到文件：%s（人格资料目录：%s）" % (raw, base))
+    except OSError as e:
+        raise LedgerError("这个路径打不开：%s" % e)
     if real != base and not real.is_relative_to(base):
         raise LedgerError("只能读人格资料目录（%s）里的文件：%s 不在里面"
-                          % (base, path))
+                          % (base, raw))
     if real.is_dir():
-        raise LedgerError("这是个目录不是文件：%s" % path)
+        raise LedgerError("这是个目录不是文件：%s" % raw)
     if not real.is_file():
-        raise LedgerError("没找到文件：%s（人格资料目录：%s）" % (path, base))
+        raise LedgerError("没找到文件：%s（人格资料目录：%s）" % (raw, base))
     if real.stat().st_size > PERSONA_FILE_MAX:
         raise LedgerError("文件超过 128KB：手写导入装不下，先拆。")
     try:
