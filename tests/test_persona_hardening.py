@@ -171,6 +171,58 @@ def test_a1_read_persona_file_blank_arg(mod):
         mod._read_persona_file("   ")
 
 
+# -- C1：相对路径按人格资料目录解析 ------------------------------------------
+
+def test_c1_relative_resolved_against_pfdir_not_cwd(plugin, pfdir, tmp_path, monkeypatch):
+    """CWD 切到别处，只给文件名也能导入——相对路径按 persona_files 解析。"""
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    (pfdir / "persona.txt").write_text("[70] 相对路径来的\n", encoding="utf-8")
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 persona.txt")
+    assert "已手写写入 1 条" in out
+    rows = plugin.ledger.list_persona()
+    assert rows[0]["content"] == "相对路径来的" and rows[0]["priority"] == 70
+
+
+def test_c1_relative_subdir_ok(plugin, pfdir):
+    """子目录里的相对路径（sub/a.txt）也按 persona_files 解析。"""
+    sub = pfdir / "sub"
+    sub.mkdir()
+    (sub / "a.txt").write_text("[60] 子目录里的\n", encoding="utf-8")
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 sub/a.txt")
+    assert "已手写写入 1 条" in out
+    rows = plugin.ledger.list_persona()
+    assert rows[0]["content"] == "子目录里的"
+
+
+def test_c1_relative_parent_escape_rejected(plugin, pfdir, tmp_path):
+    """../ 开头的相对路径不许跳出 persona_files。"""
+    (tmp_path / "outside.txt").write_text("[10] 外面的\n", encoding="utf-8")
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 ../outside.txt")
+    assert "人格资料目录" in out
+    assert plugin.ledger.list_persona() == []
+
+
+def test_c1_absolute_outside_rejected(plugin, pfdir, tmp_path):
+    """目录外的绝对路径照旧拒绝。"""
+    outside = tmp_path / "abs_outside.txt"
+    outside.write_text("[10] 外面的绝对路径\n", encoding="utf-8")
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % outside)
+    assert "人格资料目录" in out
+    assert plugin.ledger.list_persona() == []
+
+
+def test_c1_absolute_inside_still_ok(plugin, pfdir):
+    """目录内的绝对路径照常导入（防回归）。"""
+    p = pfdir / "abs_ok.txt"
+    p.write_text("[50] 绝对路径防回归\n", encoding="utf-8")
+    out = _cmd(plugin, "cmd_persona", "/人格 导入文件 %s" % p)
+    assert "已手写写入 1 条" in out
+    rows = plugin.ledger.list_persona()
+    assert rows[0]["content"] == "绝对路径防回归" and rows[0]["priority"] == 50
+
+
 # -- A2：封印失败不注入 core -------------------------------------------------
 
 def _seed_both(ledger):
