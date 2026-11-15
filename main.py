@@ -29,11 +29,13 @@ try:
                          AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
                          Ledger, LedgerError, StaleHeadError, match_denial_keywords,
                          tokenize)
+    from .persona_text import parse_persona_text
 except ImportError:  # 直接当脚本跑时
     from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
                         AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
                         Ledger, LedgerError, StaleHeadError, match_denial_keywords,
                         tokenize)
+    from persona_text import parse_persona_text
 
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
 # 版本号单一来源是 metadata.yaml；这里与之保持一致（一致性由
@@ -311,10 +313,15 @@ class MemoryCommitPlugin(Star):
         summary = auto_sink_summary(rows)
         if not summary:
             return {}
-        res = self.ledger.remember(
-            summary, level="day",
-            tags="%s,%s" % (AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG),
-            importance=0.45)
+        # 自动写入收口：沉淀必须在 restricted_auto_write 范围内执行。
+        # 此范围内人格分区（core_rule）只读——Ledger 门面层与
+        # CommitBuilder 层的人格写入口都会硬拦，自动路径写人格
+        # 只会得到 LedgerError，不存在静默绕过。
+        with self.ledger.restricted_auto_write():
+            res = self.ledger.remember(
+                summary, level="day",
+                tags="%s,%s" % (AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG),
+                importance=0.45)
         self._last_sink_seq = max(int(r["seq"]) for r in rows)
         self._turn_since_sink = 0
         return res
@@ -604,6 +611,135 @@ class MemoryCommitPlugin(Star):
             lines.extend("- " + p for p in res["problems"])
         yield event.plain_result("\n".join(lines))
 
+    def _persona_import(self, text: str) -> str:
+        """解析并写入手写人格，返回给人看的一句话。
+
+        解析在 persona_text（纯函数），写入在 Ledger.add_persona_batch
+        （带闸、整批一个提交）。这里只负责把结果翻成人话。
+        """
+        res = parse_persona_text(text)
+        if res["problems"]:
+            return "这批没写：\n" + "\n".join(
+                "- " + p for p in res["problems"][:8])
+        try:
+            ids = self.ledger.add_persona_batch(res["items"], source="handwrite")
+        except LedgerError as e:
+            return "没写上：%s" % e
+        head = self.ledger.head()
+        shown = "、".join(ids[:8]) + ("…" if len(ids) > 8 else "")
+        return "已手写写入 %d 条自我设定：%s（一个提交 %s）" % (len(ids), shown, head)
+
+    @filter.command("人格")
+    async def cmd_persona(self, event: AstrMessageEvent):
+        """自我设定（人格分区）：/人格 查 | /人格 加 内容 | /人格 改 p1 新内容 [权重N] | /人格 删 p1 | /人格 导入 多行文本"""
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
+        raw = (event.get_message_str() or "").strip()
+        parts = raw.split(None, 1)
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        sub, arg = "", ""
+        if rest:
+            sp = rest.split(None, 1)
+            sub = sp[0].strip()
+            arg = sp[1].strip() if len(sp) > 1 else ""
+        if sub in ("", "查", "列表", "list"):
+            rows = self.ledger.list_persona()
+            if not rows:
+                yield event.plain_result("还没有任何人格设定（基础设定未播种，自我设定也没有）。")
+                return
+            lines = ["人格设定：", ""]
+            for r in rows:
+                tag = "基础·只读" if r["kind"] == "core" else "自我"
+                lines.append("%s [%s · 权重 %d] %s" % (
+                    r["id"], tag, int(r["priority"]),
+                    _short(r["content"], 60)))
+            yield event.plain_result("\n".join(lines))
+            return
+        if sub in ("加", "新增", "add"):
+            if not arg:
+                yield event.plain_result("用法：/人格 加 内容（一句话，200 字内）")
+                return
+            try:
+                pid = self.ledger.add_persona("self", arg)
+            except LedgerError as e:
+                yield event.plain_result("没加上：%s" % e)
+                return
+            yield event.plain_result("已新增自我设定 %s（提交 %s）" % (
+                pid, self.ledger.head()))
+            return
+        if sub in ("导入", "手写", "import"):
+            if not arg:
+                yield event.plain_result(
+                    "用法：/人格 导入 一行一条；[权重] 前缀可省，整批一个提交。\n"
+                    "例：/人格 导入\n[50] 认准的事会坚持\n说话短句为主\n"
+                    "以 # 开头的行是注释。要读文件用 /人格 导入文件 路径")
+                return
+            yield event.plain_result(self._persona_import(arg))
+            return
+        if sub in ("导入文件", "导入文本", "importfile"):
+            if not arg:
+                yield event.plain_result("用法：/人格 导入文件 D:\\persona.txt")
+                return
+            path = Path(arg.strip().strip('"').strip("'"))
+            try:
+                if not path.is_file():
+                    yield event.plain_result("没找到文件：%s" % path)
+                    return
+                if path.stat().st_size > 128 * 1024:
+                    yield event.plain_result("文件超过 128KB：手写导入装不下，先拆。")
+                    return
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as e:
+                yield event.plain_result("读不了这个文件：%s" % e)
+                return
+            yield event.plain_result(self._persona_import(text))
+            return
+        if sub in ("改", "更新", "update"):
+            if not arg:
+                yield event.plain_result(
+                    "用法：/人格 改 p1 新内容 [权重N]（只改权重时可省内容）")
+                return
+            sp = arg.split(None, 1)
+            rid = sp[0].strip()
+            rest_arg = sp[1].strip() if len(sp) > 1 else ""
+            m = re.search(r"权重\s*(\d+)\s*$", rest_arg)
+            prio = int(m.group(1)) if m else None
+            content_part = rest_arg[:m.start()].strip() if m else rest_arg
+            if not content_part and prio is None:
+                yield event.plain_result("没说要改什么：给新内容或权重（权重N）。")
+                return
+            try:
+                ok = self.ledger.update_persona(
+                    rid, content=content_part or None, priority=prio)
+            except LedgerError as e:
+                yield event.plain_result("没改成：%s" % e)
+                return
+            if not ok:
+                yield event.plain_result("没改成：设定 %s 不存在或内容没变。" % rid)
+                return
+            yield event.plain_result("已更新设定 %s（提交 %s）" % (
+                rid, self.ledger.head()))
+            return
+        if sub in ("删", "删除", "remove"):
+            rid = arg.strip()
+            if not rid:
+                yield event.plain_result("用法：/人格 删 p1")
+                return
+            try:
+                ok = self.ledger.remove_persona(rid)
+            except LedgerError as e:
+                yield event.plain_result("没删掉：%s" % e)
+                return
+            if not ok:
+                yield event.plain_result("没删掉：设定 %s 不存在。" % rid)
+                return
+            yield event.plain_result("已删除设定 %s（提交 %s）" % (
+                rid, self.ledger.head()))
+            return
+        yield event.plain_result(
+            "不认识的子命令：%s。可用：查 / 加 / 改 / 删，直接发「/人格」看全部。" % sub)
+
     # ------------------------------------------------------------------
     # 唤起：在开口之前先想起点什么
     # ------------------------------------------------------------------
@@ -700,16 +836,25 @@ class MemoryCommitPlugin(Star):
         except Exception as e:  # 唤起失败绝不能影响聊天本身
             self._note_failure("唤起失败", e)
             return
+        # 人格分区注入（v7）：人格先于记忆。独立预算（persona_text 自带
+        # 1200 字默认），与 render_brief 互不挤占；整段 try/except，
+        # 人格炸了只记失败原因，回复照常——人格是加分项不是门槛。
+        try:
+            persona = self.ledger.persona_text()
+        except Exception as e:
+            self._note_failure("人格注入失败", e)
+            persona = ""
         self._log_injection("injected" if brief else "no_hit",
                             query_len=len(query), stats=stats, result=result,
                             long_prompt=long_prompt,
                             prompt_len=len(raw) if long_prompt else 0)
-        if not brief:
+        if not brief and not persona:
             return
         if result.get("profiles"):
             self._profile_injected_at = time.time()
         base = getattr(req, "system_prompt", "") or ""
-        req.system_prompt = (base + "\n\n" + brief) if base else brief
+        body = "\n\n".join(s for s in (persona, brief) if s)
+        req.system_prompt = (base + "\n\n" + body) if base else body
 
     @filter.on_llm_response()
     async def record_reply(self, event: AstrMessageEvent, resp) -> None:
@@ -933,6 +1078,60 @@ class MemoryCommitPlugin(Star):
         except LedgerError as e:
             return "没记住：%s" % e
         return "画像已更新（%s）" % res["profile_id"]
+
+    @filter.llm_tool(name="memory_persona")
+    async def memory_persona(self, event: AstrMessageEvent, action: str = "list",
+                             id: str = "", content: str = "",
+                             priority=None) -> str:
+        """查看或维护「我是谁」的自我设定（人格分区）。
+
+        只管理自我设定（self 分区）：新增、修改、删除、查看。
+        基础设定（core 分区）是只读的，写不进去，也不在这里展示。
+
+        Args:
+            action(string): 只能是 list / add / update / remove
+            id(string): update 或 remove 时的设定编号，形如 p3；list 与 add 不用
+            content(string): 设定内容，一句话不超过 200 字；add 必填，
+                update 想改内容时才填
+            priority(int): 权重 0-1000，越大越靠前；add 默认 0，
+                update 想改权重时才填，不填表示不改
+        """
+        if not _is_owner(event):
+            return "不可用：记忆账本只在用户和助手的私聊里开放。"
+        act = str(action or "").strip().lower()
+        try:
+            if act == "list":
+                # 只列 self 分区：基础设定不暴露给模型，免得它惦记只读行
+                rows = self.ledger.list_persona("self")
+                if not rows:
+                    return "还没有任何自我设定。"
+                return "\n".join("%s · 权重 %d · %s" % (
+                    r["id"], int(r["priority"]), r["content"])
+                    for r in rows)
+            if act == "add":
+                pid = self.ledger.add_persona(
+                    "self", _as_text(content, "设定内容", limit=200),
+                    priority=_as_int(priority, 0))
+                return "已新增自我设定 %s（提交 %s）" % (pid, self.ledger.head())
+            if act == "update":
+                rid = _as_text(id, "设定编号")
+                prio = None if priority is None else _as_int(priority, 0)
+                text = None
+                if str(content or "").strip():
+                    text = _as_text(content, "设定内容", limit=200)
+                if text is None and prio is None:
+                    return "没说要改什么：content 和 priority 至少给一个。"
+                if self.ledger.update_persona(rid, content=text, priority=prio):
+                    return "已更新设定 %s（提交 %s）" % (rid, self.ledger.head())
+                return "没改成：设定 %s 不存在或内容没变。" % rid
+            if act == "remove":
+                rid = _as_text(id, "设定编号")
+                if self.ledger.remove_persona(rid):
+                    return "已删除设定 %s（提交 %s）" % (rid, self.ledger.head())
+                return "没删掉：设定 %s 不存在。" % rid
+            return "不认识的 action：%s，只能 list / add / update / remove。" % act
+        except LedgerError as e:
+            return "没完成：%s" % e
 
     # ------------------------------------------------------------------
 

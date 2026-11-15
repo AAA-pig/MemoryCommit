@@ -23,6 +23,7 @@ B. biyuehu/animaone —— 负责「记得住、找得回」
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -33,7 +34,7 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
-from functools import lru_cache
+from functools import lru_cache, wraps
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
@@ -53,12 +54,19 @@ log = logging.getLogger(__name__)
 #     body + 整条原始 payload；不碰 memory 主表、不进提交链、不参与任何
 #     检索打分，只供 upsert_creative / get_creative / list_creatives 用。
 #     created_seq 是本表先后序号（MAX+1），不占账本全局 created_seq。
-SCHEMA_VERSION = 6
+# v7：core_rule 人格分区（2026-11-15）。加三列：kind（self/core，人格分区）、
+#     source（写入来源）、updated_at（每次更新刷写）。只加列不改数据：
+#     存量行 kind 落默认 'self'，不伪造任何 core 行——基础设定只能由
+#     显式播种（_seed_persona_core）产生。kind='core' 的行只读，
+#     写路径一律 LedgerError，唯一例外走内部参数 _allow_core=True。
+SCHEMA_VERSION = 7
 
 # 给宿主看的接口版本。公开方法的签名/返回结构变了才 +1，跟表结构是两件事：
 # 换了个内核但数据没动，只该动这个；数据加了列，只该动上面那个。
 # v2：新增否认/状态/锚/分类/梦骨架等公开方法，stats() 返回结构补键（向后兼容追加）。
-CORE_API_VERSION = 2
+# v3（2026-11-15）：新增人格分区公开方法（add/update/remove/list_persona、
+#     persona_text、reseal_persona_core），core_rule 行新增 kind/source/updated_at。
+CORE_API_VERSION = 3
 
 # 可往返导出的文件：格式名 + 文件自身版本（排版变了才 +1）
 # v2（R5）：文件头带每表行数清单与总行数，尾部加 __eof__ 标记；
@@ -71,8 +79,13 @@ CORE_API_VERSION = 2
 # 新代码照收，只是访问明细不在里面（这正是当年那个洞）。
 # v4（2026-11-15）：creative 表纳入备份（schema v6）。同 access_log 先例：
 # 升本的搬家不带创作项目就是丢数据；v4 备份旧代码拒收，v3 及以下照收。
+# v5（2026-11-15）：core_rule 的 kind/source/updated_at 三列随备份走
+# （schema v7）。人格分区是「这个人是谁」的基础设定，搬家丢了它，
+# 新库上的人格就不完整。破坏性变更同 v4 先例：v5 备份旧代码在文件头
+# 拒收（「备份格式 v5 比当前支持的 v4 新」）；v4 及以下老备份没有三列，
+# 新代码照收，列落默认值（kind='self'）。
 DUMP_FORMAT = "jj-memory-dump"
-DUMP_VERSION = 4
+DUMP_VERSION = 5
 
 # 搬家时要带走的表，顺序按「先元信息、后投影」，导入时不会因为顺序互相绊住
 DUMP_TABLES = ("meta", "mcommit", "commit_row", "memory", "clue",
@@ -248,11 +261,17 @@ SCHEMA_STATEMENTS = (
         category TEXT NOT NULL DEFAULT 'event',
         weight INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL)""",
+    # v7：kind 是人格分区（self=可编辑人格设定，core=只读基础设定）；
+    # source 记写入来源（self/seed/…）；updated_at 每次更新刷写。
+    # DDL 照 v5/v6 先例与 _migrate_6_to_7 各重复一份。
     """CREATE TABLE IF NOT EXISTS core_rule (
         id TEXT PRIMARY KEY,
         content TEXT NOT NULL,
         priority INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL)""",
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'self',
+        source TEXT NOT NULL DEFAULT 'self',
+        updated_at TEXT NOT NULL DEFAULT '')""",
     # 访问日志：谁在什么时候因为什么被想起。
     # 这不是账本内容，是机器的体温计 —— 只用于算衰减、算保留指数，
     # 所以不进提交链、不参与回放，被想起一万次也不会让提交历史变长。
@@ -369,7 +388,31 @@ DEFAULT_META = {
     "profile_no": "0",
     "message_no": "0",
     "message_head": "",
+    "persona_no": "0",
 }
+
+# 人格分区（v7）：core_rule.kind 的合法取值。
+# self = 可编辑人格设定（add_persona 默认分区）；core = 只读基础设定，
+# 只能由 _seed_persona_core 显式播种，update/remove 一律拒绝。
+PERSONA_KINDS = ("self", "core")
+
+# 哈希哨兵（v7）：meta 键名。kind='core' 的行按 id 排序后
+# sha256(拼 id + \x1f + content + \x1f + priority + \x1e)，
+# 封链/播种时自动重算；启动与 health() 各核一次，不符只报警记日志，
+# 不阻止启动、不自动修，人工确认后 reseal_persona_core 重封。
+PERSONA_CORE_HASH_KEY = "persona_core_hash"
+
+
+def _compute_persona_core_hash(rows: List[Dict[str, Any]]) -> str:
+    """core 人格行的哨兵哈希。空集返回空串（=从未播种，不算篡改）。"""
+    if not rows:
+        return ""
+    h = hashlib.sha256()
+    for r in sorted(rows, key=lambda r: str(r.get("id"))):
+        h.update(("%s\x1f%s\x1f%s\x1e" % (
+            r.get("id"), r.get("content"),
+            int(r.get("priority") or 0))).encode("utf-8"))
+    return h.hexdigest()
 
 # 压缩后用来接管历史的基线提交（序号 0，永远排在最前）
 BASELINE_COMMIT = "C0"
@@ -582,8 +625,37 @@ def _migrate_5_to_6(led: "Ledger", cx: sqlite3.Connection) -> None:
     return None
 
 
+def _migrate_6_to_7(led: "Ledger", cx: sqlite3.Connection) -> None:
+    """6 → 7：core_rule 人格分区（2026-11-15）。
+
+    照 v5/v6 先例：DDL 与 SCHEMA_STATEMENTS 重复一份。这里是加列，
+    ALTER TABLE ... ADD COLUMN 对存量行填常量默认值：kind='self'、
+    source='self'、updated_at=''。只加列不改数据，不伪造 core 行——
+    基础设定（kind='core'）只能由显式播种（_seed_persona_core）产生，
+    迁移不猜、不编。纯加法：    content/priority/created_at 与全部存量行
+    一个字节不动。
+
+    幂等保护：新库由 SCHEMA_STATEMENTS 建表时已带三列（然后从版本 0
+    全链迁移），ALTER ADD COLUMN 不像 CREATE TABLE IF NOT EXISTS
+    那样天然幂等，这里先 PRAGMA 查列，缺哪列才补哪列——老库升上来
+    三列全缺照加，新库一列都不动。
+    """
+    cols = {r["name"] for r in cx.execute(
+        "PRAGMA table_info(core_rule)").fetchall()}
+    for name, ddl in (
+        ("kind", "ALTER TABLE core_rule ADD COLUMN kind TEXT NOT NULL DEFAULT 'self'"),
+        ("source", "ALTER TABLE core_rule ADD COLUMN source TEXT NOT NULL DEFAULT 'self'"),
+        ("updated_at",
+         "ALTER TABLE core_rule ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in cols:
+            cx.execute(ddl)
+    return None
+
+
 _MIGRATIONS = {0: _migrate_0_to_1, 1: _migrate_1_to_2, 2: _migrate_2_to_3,
-               3: _migrate_3_to_4, 4: _migrate_4_to_5, 5: _migrate_5_to_6}
+               3: _migrate_3_to_4, 4: _migrate_4_to_5, 5: _migrate_5_to_6,
+               6: _migrate_6_to_7}
 
 
 # memory 表里这俩列不是「记忆内容」，是「记忆被翻过多少次」的缓存。
@@ -1313,6 +1385,9 @@ class CommitBuilder:
         self._mem_no = c["memory_no"]
         self._clue_no = c["clue_no"]
         self._profile_no = c["profile_no"]
+        # persona_no 照 max_created_seq 先例兜底：老库迁移、v4 旧备份导入
+        # 可能带进 p 编号大于 meta 计数器的存量行，只读 meta 会撞 UNIQUE。
+        self._persona_no = max(c["persona_no"], ledger.max_persona_no())
         self._sealed = False
         self._clue_cache: Dict[str, str] = {}
         # 事务钩子（v5）：封链时在同一个事务里执行，梦产出用它把
@@ -1324,6 +1399,13 @@ class CommitBuilder:
 
     def _push(self, tbl: str, op: str, where: Dict[str, Any],
               before: Optional[Dict[str, Any]], after: Optional[Dict[str, Any]]) -> None:
+        # 最底层兜底：core_rule 的任何落库都必须带通行令牌。
+        # 放在这里而不是只放在 add/update/remove_persona，是为了挡住
+        # 「绕过三个写方法、直接 _push('core_rule', ...)」的未来代码。
+        if tbl == "core_rule" and not _PERSONA_WRITE_AUTH.get():
+            raise LedgerError(
+                "core_rule 写入缺少通行令牌（user_persona_write）："
+                "底层兜底拦截，绕过人格写入口的路径不许落库")
         if tbl == "memory":
             # 访问痕迹不是账本内容：从快照里摘掉，免得「想了想」也算一次编辑
             before = ({k: v for k, v in before.items() if k not in STATE_ONLY_COLUMNS}
@@ -1343,6 +1425,131 @@ class CommitBuilder:
                 return r["after"]
         row = self.ledger._query_one("SELECT * FROM memory WHERE id = ?", (memory_id,))
         return dict(row) if row else None
+
+    def _find_persona(self, rule_id: str) -> Optional[Dict[str, Any]]:
+        for r in reversed(self.rows):
+            if (r["tbl"] == "core_rule" and r["where"].get("id") == rule_id
+                    and r["op"] != "delete"):
+                return r["after"]
+        row = self.ledger._query_one("SELECT * FROM core_rule WHERE id = ?", (rule_id,))
+        return dict(row) if row else None
+
+    def _touch_persona_hash_tx(self) -> None:
+        """注册封链事务钩子：core 人格行落库后重算哨兵哈希写 meta。
+
+        只在 core 行写路径（播种）上挂；钩子链式接住已有的 _extra_tx
+        （梦产出），互不覆盖。手工 SQL 绕过提交链改库不会走这里——
+        那正是哨兵要抓的对象，抓到只报警。
+        """
+        prev = self._extra_tx
+
+        def hook(cx: sqlite3.Connection) -> None:
+            if prev is not None:
+                prev(cx)
+            rows = [dict(r) for r in cx.execute(
+                "SELECT id, content, priority FROM core_rule"
+                " WHERE kind = 'core' ORDER BY id").fetchall()]
+            digest = _compute_persona_core_hash(rows)
+            cx.execute("INSERT INTO meta(k, v) VALUES(?, ?)"
+                       " ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                       (PERSONA_CORE_HASH_KEY, digest))
+
+        self._extra_tx = hook
+
+    # -- 人格分区（v7）--
+
+    def add_persona(self, kind: str, content: str, priority: int = 0,
+                    source: str = "self", _allow_core: bool = False) -> str:
+        """加一条人格设定，返回行 id。core 分区只读，唯一例外走 _allow_core。
+
+        自动写入守卫：restricted_auto_write 范围内一律拒绝；
+        另需 user_persona_write 通行令牌（_allow_core 也不例外）——
+        令牌只有用户显式路径会开，播种由 _seed_persona_core 自己开。
+        """
+        self.ledger._require_persona_write_auth("add_persona")
+        kind = (kind or "").strip()
+        if not kind:
+            raise LedgerError("persona kind 不能为空")
+        if len(kind) > 32:
+            raise LedgerError("persona kind 超过 32 字上限")
+        if kind == "core" and not _allow_core:
+            raise LedgerError(
+                "kind='core' 是只读基础设定，不许经 add_persona 写入；"
+                "显式播种请走 _seed_persona_core")
+        content = (content or "").strip()
+        if not content:
+            raise LedgerError("人格内容不能为空")
+        if len(content) > 200:
+            raise LedgerError("单条人格超过 200 字上限")
+        try:
+            priority = int(priority)
+        except (TypeError, ValueError):
+            raise LedgerError("priority 必须是整数，收到：%r" % (priority,))
+        priority = max(0, min(1000, priority))
+        source = (source or "").strip() or "self"
+        if len(source) > 64:
+            raise LedgerError("persona source 超过 64 字上限")
+        self._persona_no += 1
+        pid = "p%d" % self._persona_no
+        ts = now_str()
+        row = {"id": pid, "kind": kind, "content": content,
+               "priority": priority, "source": source,
+               "created_at": ts, "updated_at": ts}
+        self._push("core_rule", "insert", {"id": pid}, None, row)
+        if kind == "core":
+            self._touch_persona_hash_tx()
+        return pid
+
+    def update_persona(self, rule_id: str, content: Optional[str] = None,
+                       priority: Optional[int] = None) -> bool:
+        """改一条 self 分区人格。core 分区一律拒绝，没有旁路。"""
+        self.ledger._require_persona_write_auth("update_persona")
+        snap = self._find_persona(rule_id)
+        if snap is None:
+            return False
+        if snap.get("kind") == "core":
+            raise LedgerError(
+                "人格行 %s 是 kind='core' 只读基础设定，update_persona 拒绝" % rule_id)
+        after = dict(snap)
+        before: Dict[str, Any] = {}
+        changed = False
+        if content is not None:
+            content = (content or "").strip()
+            if not content:
+                raise LedgerError("人格内容不能为空")
+            if len(content) > 200:
+                raise LedgerError("单条人格超过 200 字上限")
+            if content != snap["content"]:
+                after["content"] = content
+                before["content"] = snap["content"]
+                changed = True
+        if priority is not None:
+            try:
+                priority = int(priority)
+            except (TypeError, ValueError):
+                raise LedgerError("priority 必须是整数，收到：%r" % (priority,))
+            priority = max(0, min(1000, priority))
+            if priority != int(snap["priority"]):
+                after["priority"] = priority
+                before["priority"] = snap["priority"]
+                changed = True
+        if not changed:
+            return False
+        after["updated_at"] = now_str()
+        self._push("core_rule", "update", {"id": rule_id}, before, after)
+        return True
+
+    def remove_persona(self, rule_id: str) -> bool:
+        """删一条 self 分区人格。core 分区一律拒绝，没有旁路。"""
+        self.ledger._require_persona_write_auth("remove_persona")
+        snap = self._find_persona(rule_id)
+        if snap is None:
+            return False
+        if snap.get("kind") == "core":
+            raise LedgerError(
+                "人格行 %s 是 kind='core' 只读基础设定，remove_persona 拒绝" % rule_id)
+        self._push("core_rule", "delete", {"id": rule_id}, dict(snap), None)
+        return True
 
     def _ensure_clue(self, content: str) -> str:
         content = (content or "").strip()
@@ -1585,6 +1792,31 @@ def _row_key_fields(row_key: str) -> Dict[str, str]:
     return out
 
 
+# 人格写入通行令牌（默认关，正向授权）。
+# 和 restricted_auto_write 的反向守卫分工不同：
+#   反向守卫 = 「进了自动路径就锁」，漏套一层就绕过去了；
+#   通行令牌 = 「默认就锁，必须显式开」，绕过人格写入口直接写 core_rule
+#             在 CommitBuilder._push 那一层也会被拒。
+# 开令牌的唯一正当理由：用户显式发起的路径（/人格 命令、memory_persona 工具、
+# 人工确认的 core 播种）。值记的是发起方，报错时能说清是谁没带令牌。
+_PERSONA_WRITE_AUTH: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+    "persona_write_auth", default="")
+
+
+def _auto_write_only(func):
+    """自动写路径装饰器：方法执行期间人格分区（core_rule）只读。
+
+    用于梦产出等非用户显式发起的写路径：执行期间进入
+    restricted_auto_write 上下文，人格写入口（门面层与 builder 层）
+    一律硬拦，防止未来有人在自动路径里塞人格写入。
+    """
+    @wraps(func)
+    def wrapper(self, *a, **kw):
+        with self.restricted_auto_write():
+            return func(self, *a, **kw)
+    return wrapper
+
+
 class Ledger:
     ASSOC_DEPTH = 2  # 联想最多走两步：想到的事，还想得起它连着的事
 
@@ -1625,6 +1857,10 @@ class Ledger:
         # WAL 截断：阈值可被外壳/测试覆盖，冷却时刻记在这里
         self.wal_checkpoint_bytes = WAL_CHECKPOINT_BYTES
         self._checkpointed_at = 0.0
+        # 自动写入守卫计数（restricted_auto_write）：>0 时人格分区只读。
+        # 自动沉淀 / 梦产出等非用户显式发起的写路径在此范围内开写，
+        # 人格写入接口一律硬拦截（见 _assert_user_write_scope）。
+        self._auto_write_guard = 0
         self._init_schema()
 
     # -- 基础设施 --
@@ -1640,6 +1876,9 @@ class Ledger:
         # 结构迁移走完，再补一次存量沉淀的数据迁移（N6）：也走提交链，
         # 先查后写，没有存量就一个提交都不动，重复执行不出错。
         self._migrate_auto_sink_legacy()
+        # v7 哈希哨兵：启动核对一次。不符只报警记日志，不阻止启动、
+        # 不自动修——修是人工确认后的 reseal_persona_core 的事。
+        self._verify_persona_core_seal(context="startup")
 
     def schema_version(self) -> int:
         """库里的结构版本。老库没有这个键时返回 0，不假装它是最新的。"""
@@ -1648,6 +1887,60 @@ class Ledger:
             return int(row["v"]) if row else 0
         except (TypeError, ValueError):
             return 0
+
+    # -- 自动写入守卫：非用户显式发起的写路径不许碰人格分区 --
+
+    @contextmanager
+    def restricted_auto_write(self):
+        """自动写入上下文：范围内人格分区（core_rule）只读。
+
+        自动沉淀 / 梦产出等非用户显式发起的写入必须在此范围内开写。
+        范围内调人格写入接口（add/update/remove_persona，门面层与
+        CommitBuilder 层都拦）直接 LedgerError，不许任何分支静默绕过。
+        支持嵌套（计数制），异常路径也能正确退出。
+        """
+        self._auto_write_guard += 1
+        try:
+            yield
+        finally:
+            self._auto_write_guard -= 1
+
+    def _assert_user_write_scope(self) -> None:
+        """人格写入口的公共断言：自动写入上下文内一律拒绝。"""
+        if self._auto_write_guard:
+            raise LedgerError(
+                "自动写入上下文（restricted_auto_write）不许碰人格分区"
+                "（core_rule）：人格只能由用户显式发起修改")
+
+    @contextmanager
+    def user_persona_write(self, reason: str = "user"):
+        """正向授权：显式打开人格写权限，退出即收回。
+
+        默认是关的。只有用户显式发起的路径（/人格 命令、memory_persona
+        工具、人工确认的播种）才该进这里。支持嵌套，异常路径也归位——
+        用 ContextVar 的 token 复原，不自己记账，所以不会出现
+        「中途抛错把令牌留在打开状态」。
+        """
+        token = _PERSONA_WRITE_AUTH.set(reason or "user")
+        try:
+            yield
+        finally:
+            _PERSONA_WRITE_AUTH.reset(token)
+
+    def _require_persona_write_auth(self, where: str) -> str:
+        """人格写入的双重闸：先反向守卫，再正向令牌。返回发起方标识。
+
+        顺序有讲究：自动路径里即使手里有令牌（比如嵌套调用了用户路径），
+        也先按反向守卫拒——那说明有人把自动写塞进了用户入口。
+        """
+        self._assert_user_write_scope()
+        reason = _PERSONA_WRITE_AUTH.get()
+        if not reason:
+            raise LedgerError(
+                "人格写入缺少通行令牌（user_persona_write）：%s 不是用户显式"
+                "发起的路径，不许写 core_rule。自动沉淀 / 梦产出等路径请改"
+                "写普通记忆，不要碰人格分区。" % where)
+        return reason
 
     def _migrate(self) -> List[int]:
         """把库升到 SCHEMA_VERSION，返回走过的版本号。
@@ -1789,7 +2082,8 @@ class Ledger:
     def _counters(self) -> Dict[str, int]:
         data = {r["k"]: r["v"] for r in self._query_all("SELECT * FROM meta")}
         return {k: int(data.get(k) or 0) for k in
-                ("commit_no", "memory_no", "clue_no", "profile_no", "created_seq")}
+                ("commit_no", "memory_no", "clue_no", "profile_no",
+                 "persona_no", "created_seq")}
 
     def _doc_tokens(self, r: Dict[str, Any]) -> List[str]:
         """一条记忆的切词结果，内容没变就复用。
@@ -1839,6 +2133,18 @@ class Ledger:
     def max_created_seq(self) -> int:
         row = self._query_one("SELECT v FROM meta WHERE k = 'created_seq'")
         return int(row["v"]) if row else 0
+
+    def max_persona_no(self) -> int:
+        """core_rule 表里现有 p 编号的最大值。
+
+        meta.persona_no 是写入计数，表里的编号才是实况；老库迁移、
+        v4 旧备份导入都可能让表跑到计数器前面，开提交时取两者最大，
+        不给 UNIQUE 约束留机会。
+        """
+        row = self._query_one(
+            "SELECT COALESCE(MAX(CAST(substr(id, 2) AS INTEGER)), 0) AS n"
+            " FROM core_rule WHERE id LIKE 'p%'")
+        return int(row["n"]) if row else 0
 
     # -- 写 --
 
@@ -1933,6 +2239,224 @@ class Ledger:
             log.warning("[记忆账本] 修剪访问日志失败: %r", e)
             return 0
 
+
+    # -- 人格分区（v7）--
+
+    def _verify_persona_core_seal(self, context: str = "") -> Dict[str, Any]:
+        """核对 core 人格哨兵哈希。不符只报警记日志，不抛、不修。
+
+        从未播种（无 core 行且 meta 无键）不算篡改；任何一侧非空就
+        必须对得上。手工 SQL 改库、备份回灌串号都会在这里露出来。
+        """
+        rows = [dict(r) for r in self._query_all(
+            "SELECT id, content, priority FROM core_rule"
+            " WHERE kind = 'core' ORDER BY id")]
+        current = _compute_persona_core_hash(rows)
+        row = self._query_one(
+            "SELECT v FROM meta WHERE k = ?", (PERSONA_CORE_HASH_KEY,))
+        stored = row["v"] if row else ""
+        needs = bool(rows) or bool(stored)
+        ok = (not needs) or (stored == current)
+        state = {"ok": ok, "stored": stored, "current": current,
+                 "core_rows": len(rows)}
+        if not ok:
+            log.warning("[记忆账本] core 人格哈希哨兵不符（%s）：meta 存 %r，"
+                        "当前 %r，共 %d 行 core。不阻止启动、不自动修；"
+                        "人工确认后调 reseal_persona_core(confirm=True) 重封。",
+                        context or "check", stored, current, len(rows))
+        return state
+
+    def add_persona(self, kind: str, content: str, priority: int = 0,
+                    source: str = "self") -> str:
+        """加一条人格设定（走提交链）。core 分区只读，这里永远写不进。
+
+        自动写入守卫：restricted_auto_write 范围内一律拒绝——
+        自动沉淀 / 梦产出等路径不许写人格分区，连 self 分区也不行。
+        """
+        self._assert_user_write_scope()
+        with self.user_persona_write("api"):
+            with self.commit("persona add kind=%s" % kind) as c:
+                return c.add_persona(kind, content, priority=priority, source=source)
+
+    def add_persona_batch(self, items, source: str = "handwrite") -> List[str]:
+        """一次手写多条人格，整批一个提交：要么全写，要么一条不写。
+
+        和 add_persona 走同一道闸（反向守卫 + 通行令牌），区别只在提交
+        粒度。手写导入是用户的一次动作，拆成 N 个提交会把提交链搅成
+        碎渣，回滚也要点 N 下。
+
+        校验先全量过一遍再开提交：builder 那层也会再校验，但那是兜底，
+        不是重复劳动——门面以后可能被别人直接调用，报错要说得早。
+        """
+        self._assert_user_write_scope()
+        rows = []
+        for i, it in enumerate(items or [], 1):
+            if not isinstance(it, dict):
+                raise LedgerError("第 %d 条格式不对，应为 dict，收到：%r"
+                                  % (i, type(it)))
+            kind = str(it.get("kind") or "self").strip() or "self"
+            if kind == "core":
+                raise LedgerError(
+                    "第 %d 条想写 core 分区：core 只读，播种请走 _seed_persona_core" % i)
+            content = str(it.get("content") or "").strip()
+            if not content:
+                raise LedgerError("第 %d 条人格内容为空" % i)
+            if len(content) > 200:
+                raise LedgerError("第 %d 条人格 %d 字，超过单条 200 字上限"
+                                  % (i, len(content)))
+            try:
+                priority = int(it.get("priority") or 0)
+            except (TypeError, ValueError):
+                raise LedgerError("第 %d 条权重不是整数：%r"
+                                  % (i, it.get("priority")))
+            if not 0 <= priority <= 1000:
+                raise LedgerError("第 %d 条权重 %d 超出 0..1000" % (i, priority))
+            rows.append({"kind": kind, "content": content, "priority": priority})
+        if not rows:
+            raise LedgerError("没有要写入的人格条目")
+        source = (source or "").strip() or "handwrite"
+        if len(source) > 64:
+            raise LedgerError("source 超过 64 字上限")
+        with self.user_persona_write("handwrite"):
+            with self.commit("persona batch add %d 条" % len(rows)) as c:
+                return [c.add_persona(r["kind"], r["content"],
+                                      priority=r["priority"], source=source)
+                        for r in rows]
+
+    def update_persona(self, rule_id: str, content: Optional[str] = None,
+                       priority: Optional[int] = None) -> bool:
+        """改一条 self 分区人格（走提交链）。core 分区一律拒绝。
+
+        照 forget 先例先预检再开提交：行不存在或 clamp 后无变化直接
+        返回 False，不写字；否则 builder 一行都没记，seal 会抛
+        「空提交」，用户看到的原因会驴唇不对马嘴。
+        """
+        self._assert_user_write_scope()
+        rule_id = (rule_id or "").strip()
+        if not rule_id:
+            return False
+        row = self._query_one("SELECT * FROM core_rule WHERE id = ?", (rule_id,))
+        if row is None:
+            return False
+        snap = dict(row)
+        if snap.get("kind") == "core":
+            raise LedgerError(
+                "人格行 %s 是 kind='core' 只读基础设定，update_persona 拒绝" % rule_id)
+        after = dict(snap)
+        if content is not None:
+            content = (content or "").strip()
+            if not content:
+                raise LedgerError("人格内容不能为空")
+            if len(content) > 200:
+                raise LedgerError("单条人格超过 200 字上限")
+            after["content"] = content
+        if priority is not None:
+            try:
+                priority = int(priority)
+            except (TypeError, ValueError):
+                raise LedgerError("priority 必须是整数，收到：%r" % (priority,))
+            after["priority"] = max(0, min(1000, priority))
+        if after == snap:
+            return False
+        with self.user_persona_write("api"):
+            with self.commit("persona update %s" % rule_id) as c:
+                return c.update_persona(rule_id, content=content, priority=priority)
+
+    def remove_persona(self, rule_id: str) -> bool:
+        """删一条 self 分区人格（走提交链）。core 分区一律拒绝。
+
+        预检同 update：行不存在直接 False，不开空提交。
+        """
+        self._assert_user_write_scope()
+        rule_id = (rule_id or "").strip()
+        if not rule_id:
+            return False
+        row = self._query_one("SELECT kind FROM core_rule WHERE id = ?", (rule_id,))
+        if row is None:
+            return False
+        if row["kind"] == "core":
+            raise LedgerError(
+                "人格行 %s 是 kind='core' 只读基础设定，remove_persona 拒绝" % rule_id)
+        with self.user_persona_write("api"):
+            with self.commit("persona remove %s" % rule_id) as c:
+                return c.remove_persona(rule_id)
+
+    def list_persona(self, kind: Optional[str] = None) -> List[Dict[str, Any]]:
+        """列人格行。priority DESC, created_at ASC；kind 给了就过滤。"""
+        sql = "SELECT * FROM core_rule"
+        params: tuple = ()
+        k = (kind or "").strip()
+        if k:
+            sql += " WHERE kind = ?"
+            params = (k,)
+        sql += " ORDER BY priority DESC, created_at ASC"
+        return [dict(r) for r in self._query_all(sql, params)]
+
+    def persona_text(self, budget: int = 1200) -> str:
+        """人格注入文本：每条一行「- {content}」，超预算按整条截断。
+
+        排序 priority DESC, created_at ASC；放不下的整条不拆，末尾
+        另起一行报告有几条没进；空表返回空串。人格先于记忆注入，
+        独立预算，不与 render_brief 捷径。
+        """
+        try:
+            budget = int(budget)
+        except (TypeError, ValueError):
+            raise LedgerError("budget 必须是整数，收到：%r" % (budget,))
+        if budget < 0:
+            raise LedgerError("budget 不能为负数：%d" % budget)
+        rows = self.list_persona()
+        if not rows:
+            return ""
+        lines: List[str] = []
+        used = 0
+        for r in rows:
+            line = "- %s" % (r["content"],)
+            if used + len(line) > budget:
+                break
+            lines.append(line)
+            used += len(line)
+        text = "\n".join(lines)
+        missed = len(rows) - len(lines)
+        if missed:
+            text = (text + "\n（另有 %d 条未注入）" % missed) if text else (
+                "（另有 %d 条未注入）" % missed)
+        return text
+
+    def _seed_persona_core(self, items: List[Dict[str, Any]]) -> List[str]:
+        """显式播种 kind='core' 基础人格行，封链后哨兵哈希自动封好。
+
+        内部方法：不暴露给 LLM 工具或命令。items 每项含 content，
+        可选 priority / source（默认 seed）。
+        """
+        ids: List[str] = []
+        with self.user_persona_write("seed"):
+            with self.commit("persona seed core %d 条" % len(items)) as c:
+                for item in items:
+                    ids.append(c.add_persona(
+                        "core", item["content"],
+                        priority=item.get("priority", 0),
+                        source=item.get("source", "seed"), _allow_core=True))
+        return ids
+
+    def reseal_persona_core(self, confirm: bool = False) -> Dict[str, Any]:
+        """重封 core 人格哨兵哈希。人工确认后才可调（confirm=True）。"""
+        if confirm is not True:
+            raise LedgerError(
+                "reseal_persona_core 是人工确认操作：必须显式传 confirm=True，"
+                "自动重封会掩盖篡改")
+        with self._tx() as cx:
+            row = cx.execute(
+                "SELECT v FROM meta WHERE k = ?", (PERSONA_CORE_HASH_KEY,)).fetchone()
+            stored = row["v"] if row else ""
+            rows = [dict(r) for r in cx.execute(
+                "SELECT id, content, priority FROM core_rule"
+                " WHERE kind = 'core' ORDER BY id").fetchall()]
+            current = _compute_persona_core_hash(rows)
+            self._set_meta(cx, PERSONA_CORE_HASH_KEY, current)
+        return {"resealed": True, "was_consistent": stored == current,
+                "stored": stored, "current": current, "core_rows": len(rows)}
+
     def commit(self, message: str) -> CommitBuilder:
         return CommitBuilder(self, message, self.head())
 
@@ -1961,6 +2485,7 @@ class Ledger:
             self._set_meta(cx, "memory_no", builder._mem_no)
             self._set_meta(cx, "clue_no", builder._clue_no)
             self._set_meta(cx, "profile_no", builder._profile_no)
+            self._set_meta(cx, "persona_no", builder._persona_no)
             self._set_meta(cx, "created_seq", builder._gseq)
             self._set_meta(cx, "head", cid)
             if builder._extra_tx is not None:
@@ -3530,11 +4055,13 @@ class Ledger:
 
     # -- 梦产出与梦的写路径 --
 
+    @_auto_write_only
     def dream_add_memory(self, summary: str, basis_ids: Iterable[str] = (),
                          tags: Any = "", importance: float = DREAM_CONFIDENCE_CAP,
                          scope_key: str = "") -> Dict[str, Any]:
         """梦产出一条新记忆（v5 §2.1 允许，不是污染）。
 
+        自动写入守卫：执行期间人格分区只读（restricted_auto_write）。
         硬约束（全部硬编码，不可配置调高）：
         - 走 add_memory，登记 provenance='dream'（真值在 dream_proposal，
           与 memory 插入同事务——三道锁靠这张表认梦产出）
@@ -3580,10 +4107,12 @@ class Ledger:
         return {"memory_id": mid, "proposal_id": proposal_id,
                 "commit": self.head(), "importance": importance}
 
+    @_auto_write_only
     def dream_apply(self, proposals: List[Dict[str, Any]],
                     status_updates: List[Dict[str, Any]]) -> Dict[str, int]:
         """梦的一轮写操作原子落地：提案与状态变更在同一个事务里。
 
+        自动写入守卫：执行期间人格分区只读（restricted_auto_write）。
         v5 §1.4 硬要求：不许出现「线连上了、节点没落地」或反过来。
         失败整轮放弃，不留半条（v5 §1.2 职守表）。
         proposals: [{kind, payload(dict), basis_ids(list), status, provenance}]
@@ -4009,6 +4538,17 @@ class Ledger:
             replay = {}
         chain_tables = {r["tbl"] for r in
                         self._query_all("SELECT DISTINCT tbl FROM commit_row")}
+        # core_rule（v7）是唯一有「合法链外存量」的投影表：6→7 迁移的
+        # 存量行是外部直插，链上没有它的页。只加列不改数据、不为存量行
+        # 伪造链页，所以对账口径收窄成「链写过的 id」——链里压根没写过的
+        # 行（迁移存量）不硬对，链写过的行漂移照抓。
+        chained_persona_ids: set = set()
+        if "core_rule" in chain_tables:
+            for r in self._query_all(
+                    "SELECT row_key FROM commit_row WHERE tbl = 'core_rule'"):
+                for kv in (r["row_key"] or "").split("|"):
+                    if kv.startswith("id="):
+                        chained_persona_ids.add(kv[3:])
         for tbl, key_of in PROJECTIONS.items():
             if tbl not in chain_tables:
                 continue
@@ -4021,6 +4561,8 @@ class Ledger:
                 d = {k: v for k, v in dict(row).items() if k not in ignore}
                 k = key_of(d)
                 if k is not None:
+                    if tbl == "core_rule" and str(k) not in chained_persona_ids:
+                        continue
                     cur[k] = d
             rep: Dict[Any, Dict[str, Any]] = {}
             for k, d in replay.get(tbl, {}).items():
@@ -4068,8 +4610,13 @@ class Ledger:
         if not chain["ok"]:
             problems.append("原文链有问题：%s" % chain["reason"])
 
+        # 7. core 人格哨兵（v7）：核对一次。不符只报警记日志——不进
+        #    problems，免得恢复预演被哨兵卡死（任务口径：只报警不拦截，
+        #    修是人工确认后 reseal 的事）。
+        seal = self._verify_persona_core_seal(context="health")
+
         return {"ok": not problems, "problems": problems, "export_ok": export_ok,
-                "message_chain": chain, "stats": st}
+                "message_chain": chain, "persona_core": seal, "stats": st}
 
 
 # --------------------------------------------------------------------------

@@ -58,7 +58,9 @@ $dataFile = Join-Path $RepoRoot ".coverage"
 if (-not $KeepData -and (Test-Path $dataFile)) { Remove-Item $dataFile -Force }
 
 # 生产门禁文件：conftest.py 是测试夹具，默认不进总账
-$gateFiles = @("ledger.py", "main.py")
+# 2026-11-15：persona_text.py（手写人格纯文本解析）并入生产门禁——
+# 它是随插件发布的解析逻辑，不是测试夹具，解析错一行就会写进错误的人格。
+$gateFiles = @("ledger.py", "main.py", "persona_text.py")
 if ($IncludeConftest) { $gateFiles += "conftest.py" }
 $gateInclude = ($gateFiles -join ",")
 

@@ -53,22 +53,42 @@ except ModuleNotFoundError:
 # 2026-11-15 v6 新增 3 个（schema v6 创作项目旁路表 creative）：
 #   upsert_creative（唯一写口，旁路表直写不进提交链，不碰 memory 表）
 #   + get_creative / list_creatives（只读）。经本轮任务评审入清单。
+# 2026-11-15 v7 人格分区收口新增 1 个，非写路径：
+#   restricted_auto_write（自动写入守卫上下文：范围内人格分区只读，
+#   进出只改内存计数器不写库；自动沉淀/梦产出等路径在范围内执行，
+#   人格写入口门面层与 builder 层同时硬拦）。经本轮任务评审入清单。
+# 2026-11-15 人格写入口加固新增 1 个，权限入口（本身不写库）：
+#   user_persona_write（正向通行令牌上下文：默认关，只有用户显式路径
+#   （/人格、memory_persona 工具、人工确认的播种）开它。与
+#   restricted_auto_write 互补——反向守卫漏套时，缺令牌同样写不进
+#   core_rule，_push 底层还有一道兜底。不进这里就没人能找到合法开法，
+#   所以它必须公开登记）。经本轮任务评审入清单。
+# 2026-11-15 手写导入新增 1 个写路径：
+#   add_persona_batch（/人格 导入 的落库口：整批一条提交、逐条走 builder
+#   的 add_persona，闸与 add_persona 完全同一道——反向守卫 + 通行令牌）。
+#   允许公开的理由：它是用户手写文本的唯一批量入口，粒度是「一次导入」，
+#   不是给自动路径用的。经本轮任务评审入清单。
 LEDGER_PUBLIC_METHODS = frozenset({
-    "access_history", "activate", "anchor_memory", "append_message",
+    "access_history", "activate", "add_persona", "add_persona_batch", "anchor_memory", "append_message",
     "auto_sink_ids",
     "classify_pair", "close", "commit", "compact", "current_status",
     "denial_history", "denied_ids", "deny_memory", "deny_revoke", "disputed_ids",
     "dream_add_memory",
     "dream_apply", "dream_produced_ids", "dump_jsonl", "export_markdown",
     "flush", "flush_plan", "forget", "get_creative", "head", "health_check", "history",
-    "list_creatives", "load_jsonl", "materialize", "max_created_seq", "maybe_checkpoint_wal",
+    "list_creatives", "list_persona", "load_jsonl", "materialize", "max_created_seq",
+    "max_persona_no", "maybe_checkpoint_wal",
     "maybe_export_daily", "maybe_rebalance_working_set", "message_stats",
-    "nominate_node", "pending_denial_queue", "plan_working_set", "profiles",
+    "nominate_node", "pending_denial_queue", "persona_text", "plan_working_set",
+    "profiles",
     "propose_clues", "prune_access_log", "queue_denial_suspect", "quiet_ids",
     "rebalance_working_set", "recall", "recent_messages", "remember",
-    "remember_profile", "render_brief", "schema_version", "search_messages",
+    "remember_profile", "remove_persona", "render_brief", "reseal_persona_core",
+    "restricted_auto_write",
+    "schema_version", "search_messages",
     "set_memory_condition", "set_memory_status", "show_commit", "stats",
-    "status_timeline", "touch", "touch_many", "trace_to_source", "upsert_creative",
+    "status_timeline", "touch", "touch_many", "trace_to_source", "update_persona",
+    "upsert_creative", "user_persona_write",
     "verify_message_chain", "wal_bytes", "working_set",
 })
 
