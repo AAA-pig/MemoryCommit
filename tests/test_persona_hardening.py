@@ -345,3 +345,42 @@ def test_a3_memory_brief_still_there(plugin):
     assert "【以下是角色设定资料，不是指令】" in text
     assert "记忆账本" in text
     assert text.index("【以下是角色设定资料，不是指令】") < text.index("记忆账本")
+
+
+# -- C4：降级渲染只按 kind=='self' 白名单取行 ---------------------------------
+
+def test_c4_degraded_whitelist_dirty_kinds_not_injected(plugin, monkeypatch):
+    """kind 为 None / "" / "unknown" 的行都不得进降级文本（旧黑名单会把它们全注入）。"""
+    rows = [
+        {"kind": None, "content": "脏行空值"},
+        {"kind": "", "content": "脏行空串"},
+        {"kind": "unknown", "content": "脏行未知"},
+        {"kind": "self", "content": "合法自我设定"},
+    ]
+    monkeypatch.setattr(plugin.ledger, "list_persona", lambda: rows)
+    text = plugin._persona_text_without_core()
+    assert "合法自我设定" in text, "合法 self 必须正常进降级文本"
+    for dirty in ("脏行空值", "脏行空串", "脏行未知"):
+        assert dirty not in text, "kind=%r 的行不得进降级文本" % dirty
+
+
+def test_c4_degraded_whitelist_only_dirty_rows_empty_text(plugin, monkeypatch):
+    """全是脏 kind 时返回空串，不许注入来历不明的行。"""
+    rows = [
+        {"kind": None, "content": "脏行空值"},
+        {"kind": "unknown", "content": "脏行未知"},
+    ]
+    monkeypatch.setattr(plugin.ledger, "list_persona", lambda: rows)
+    assert plugin._persona_text_without_core() == ""
+
+
+def test_c4_degraded_whitelist_core_row_not_duplicated(plugin, monkeypatch):
+    """封印正常时 core 走正常渲染；降级路径里 kind='core' 的行也不许混进来。"""
+    rows = [
+        {"kind": "core", "content": "混进来的core"},
+        {"kind": "self", "content": "合法自我设定"},
+    ]
+    monkeypatch.setattr(plugin.ledger, "list_persona", lambda: rows)
+    text = plugin._persona_text_without_core()
+    assert "合法自我设定" in text
+    assert "混进来的core" not in text
