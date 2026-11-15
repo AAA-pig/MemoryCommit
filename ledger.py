@@ -473,6 +473,41 @@ def _compute_persona_core_hash(rows: List[Dict[str, Any]]) -> str:
             int(r.get("priority") or 0))).encode("utf-8"))
     return h.hexdigest()
 
+
+def render_persona_rows(rows: List[Dict[str, Any]], budget: int = 1200) -> str:
+    """人格行渲染（C3 收敛点，纯函数）：每条一行「- {content}」，超预算按整条截断。
+
+    persona_text 与降级渲染（main._persona_text_without_core）都走这里，
+    保证两条路径口径完全相同：budget 校验（int() 转换失败或负数抛
+    LedgerError）、放不下的整条不拆、末尾另起一行报未注入条数，全在
+    这一个函数里。一条都放不下时只报未注入条数；空 rows 返回空串。
+    只渲染：不查库、不排序，行序由调用方给的 rows 决定（正常路径是
+    list_persona 的 priority DESC, created_at ASC，降级路径沿用白名单
+    过滤后的行序）。
+    """
+    try:
+        budget = int(budget)
+    except (TypeError, ValueError):
+        raise LedgerError("budget 必须是整数，收到：%r" % (budget,))
+    if budget < 0:
+        raise LedgerError("budget 不能为负数：%d" % budget)
+    if not rows:
+        return ""
+    lines: List[str] = []
+    used = 0
+    for r in rows:
+        line = "- %s" % (r["content"],)
+        if used + len(line) > budget:
+            break
+        lines.append(line)
+        used += len(line)
+    text = "\n".join(lines)
+    missed = len(rows) - len(lines)
+    if missed:
+        text = (text + "\n（另有 %d 条未注入）" % missed) if text else (
+            "（另有 %d 条未注入）" % missed)
+    return text
+
 # 压缩后用来接管历史的基线提交（序号 0，永远排在最前）
 BASELINE_COMMIT = "C0"
 
@@ -2607,29 +2642,7 @@ class Ledger:
         另起一行报告有几条没进；空表返回空串。人格先于记忆注入，
         独立预算，不与 render_brief 捷径。
         """
-        try:
-            budget = int(budget)
-        except (TypeError, ValueError):
-            raise LedgerError("budget 必须是整数，收到：%r" % (budget,))
-        if budget < 0:
-            raise LedgerError("budget 不能为负数：%d" % budget)
-        rows = self.list_persona()
-        if not rows:
-            return ""
-        lines: List[str] = []
-        used = 0
-        for r in rows:
-            line = "- %s" % (r["content"],)
-            if used + len(line) > budget:
-                break
-            lines.append(line)
-            used += len(line)
-        text = "\n".join(lines)
-        missed = len(rows) - len(lines)
-        if missed:
-            text = (text + "\n（另有 %d 条未注入）" % missed) if text else (
-                "（另有 %d 条未注入）" % missed)
-        return text
+        return render_persona_rows(self.list_persona(), budget=budget)
 
     def _seed_persona_core(self, items: List[Dict[str, Any]]) -> List[str]:
         """显式播种 kind='core' 基础人格行，封链后哨兵哈希自动封好。

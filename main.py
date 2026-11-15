@@ -29,6 +29,7 @@ try:
                          AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
                          ATTITUDE_OWNER_ID,
                          Ledger, LedgerError, StaleHeadError, match_denial_keywords,
+                         render_persona_rows,
                          tokenize)
     from .persona_text import parse_persona_text
 except ImportError:  # 直接当脚本跑时
@@ -36,6 +37,7 @@ except ImportError:  # 直接当脚本跑时
                         AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
                         ATTITUDE_OWNER_ID,
                         Ledger, LedgerError, StaleHeadError, match_denial_keywords,
+                        render_persona_rows,
                         tokenize)
     from persona_text import parse_persona_text
 
@@ -718,28 +720,17 @@ class MemoryCommitPlugin(Star):
     def _persona_text_without_core(self) -> str:
         """封印异常时的降级渲染：core 段整段不进 system prompt。
 
-        渲染口径与 ledger.persona_text 一致（priority DESC、每条一行
-        「- 内容」、超预算整条截断、末尾报未注入条数），行序同走
-        list_persona 的排序，不会长歪。只读，不重封、不改库。
+        渲染口径与 ledger.persona_text 完全一致（C3 收敛：同走
+        render_persona_rows，budget 校验、整条截断、未注入条数全在
+        那一个函数里），行序同走 list_persona 的排序，不会长歪。
+        只读，不重封、不改库。
+
+        C4 白名单：只取 kind=='self' 的行；kind 为空、拼错或未来
+        新增的值一律不进降级文本，宁可少注入也不注入来历不明的行。
         """
         rows = [r for r in self.ledger.list_persona()
-                if (r.get("kind") or "") != "core"]
-        if not rows:
-            return ""
-        lines = []
-        used = 0
-        for r in rows:
-            line = "- %s" % (r["content"],)
-            if used + len(line) > PERSONA_INJECT_BUDGET:
-                break
-            lines.append(line)
-            used += len(line)
-        text = "\n".join(lines)
-        missed = len(rows) - len(lines)
-        if missed:
-            text = (text + "\n（另有 %d 条未注入）" % missed) if text else (
-                "（另有 %d 条未注入）" % missed)
-        return text
+                if r.get("kind") == "self"]
+        return render_persona_rows(rows, budget=PERSONA_INJECT_BUDGET)
 
     @filter.command("人格")
     async def cmd_persona(self, event: AstrMessageEvent):
@@ -799,20 +790,6 @@ class MemoryCommitPlugin(Star):
                 text = _read_persona_file(arg)
             except Exception as e:
                 yield event.plain_result("读不了：%s" % e)
-                return
-            yield event.plain_result(self._persona_import(text))
-            return
-            path = Path(arg.strip().strip('"').strip("'"))
-            try:
-                if not path.is_file():
-                    yield event.plain_result("没找到文件：%s" % path)
-                    return
-                if path.stat().st_size > 128 * 1024:
-                    yield event.plain_result("文件超过 128KB：手写导入装不下，先拆。")
-                    return
-                text = path.read_text(encoding="utf-8")
-            except (OSError, UnicodeDecodeError) as e:
-                yield event.plain_result("读不了这个文件：%s" % e)
                 return
             yield event.plain_result(self._persona_import(text))
             return
