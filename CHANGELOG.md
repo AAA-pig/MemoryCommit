@@ -2,7 +2,7 @@
 
 ## 数据修复 — 2026-11-17
 
-- 一次性数据修复（不改 schema、不走提交链伪造历史）：真库 ledger.db 里 35 条 memory 行的 start_time / end_time 是 16 位无秒格式（"YYYY-MM-DD HH:MM"，上游同步脚本旧版写入，m763 就在其中），memory_age_days 解析不出，统一追加 ":00"（条件：长度=16 且第 11 位是空格，单事务裸 SQL，仅此一次）；修前已用 SQLite backup API 整库备份至 %USERPROFILE%\.local\share\jingjing-memory\backup\ledger-pre-tsfix-20261117-134149.db（9,678,848 字节）
+- 一次性数据修复（不改 schema、不走提交链伪造历史）：真库 ledger.db 里 35 条 memory 行的 start_time / end_time 是 16 位无秒格式（"YYYY-MM-DD HH:MM"，上游同步脚本旧版写入，m763 就在其中），memory_age_days 解析不出，统一追加 ":00"（条件：长度=16 且第 11 位是空格，单事务裸 SQL，仅此一次）；修前已用 SQLite backup API 整库备份至 %USERPROFILE%\.local\share\jingjing-memory\backup\ledger-pre-tsfix-<ts>.db（约 9.2 MB）
 
 ## 1.6.0 — 2026-11-14
 
