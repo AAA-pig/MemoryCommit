@@ -904,6 +904,9 @@ def test_auto_sink_leaves_core_rule_untouched(tmp_path, monkeypatch):
     before = [dict(r) for r in plugin.ledger.list_persona()]
     import main as m
     monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
+    # G1：水位线在真实流程里由 inject_memory 在落链前初始化；这里绕开
+    # 请求阶段直接落链，先把全局水位建在链尾 0，让本轮原文落在水位后。
+    plugin._sink_watermark()
     plugin.ledger.append_message("user", "今天聊了空调和遥控器",
                                  session_id=UMO)
     guards = []

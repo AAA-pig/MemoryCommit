@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## 数据修复 — 2026-11-17
+
+- 一次性数据修复（不改 schema、不走提交链伪造历史）：真库 ledger.db 里 35 条 memory 行的 start_time / end_time 是 16 位无秒格式（"YYYY-MM-DD HH:MM"，上游同步脚本旧版写入，m763 就在其中），memory_age_days 解析不出，统一追加 ":00"（条件：长度=16 且第 11 位是空格，单事务裸 SQL，仅此一次）；修前已用 SQLite backup API 整库备份至 %USERPROFILE%\.local\share\jingjing-memory\backup\ledger-pre-tsfix-20261117-134149.db（9,678,848 字节）
+
 ## 1.6.0 — 2026-11-14
 
 按外部审查报告（《MemoryCommit 项目代码审查与改进方案》2026-11-14）做的可靠性加固轮：备份完整性、有损导入、安全表述、持久性档位、时间契约。2026-11-15 追加 v6 创作项目旁路表（同为本版内容，见下方 v6 段）。

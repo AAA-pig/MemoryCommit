@@ -557,6 +557,9 @@ def test_auto_sink_no_new_messages(mod, plugin, monkeypatch):
 def test_auto_sink_failure_counted(plugin, monkeypatch):
     import main as m
     monkeypatch.setattr(m, "AUTO_SINK_EVERY", 1)
+    # G1：水位线在真实流程里由 inject_memory 在落链前初始化；这里绕开
+    # 请求阶段直接落链，先把水位建在链尾 0，让本轮原文落在水位之后。
+    plugin._sink_watermark(UMO)
     plugin.ledger.append_message("user", "一句话")
     monkeypatch.setattr(plugin.ledger, "remember",
                         lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("写不进")))

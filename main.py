@@ -205,12 +205,23 @@ DURABILITY = (os.environ.get("JJ_MEMORY_DURABILITY", "NORMAL").strip().upper()
 AUTO_SINK_EVERY = max(0, int(os.environ.get("JJ_MEMORY_AUTO_SINK_EVERY", "0") or 0))
 AUTO_SINK_TAG = AUTO_SINK_LABEL  # 字面单一来源在 ledger.AUTO_SINK_LABEL
 
+# 沉淀水位线（G1）：meta 里按会话记「原文链沉到第几条」，
+# 键 = SINK_SEQ_PREFIX + session_id（无会话就是裸前缀）。跨重启/跨实例
+# 都在，重启不会从 0 重沉历史。SINK_AT_META 只记「最后一次沉淀
+# 发生在什么时候」，给 /记忆自检 展示。
+SINK_SEQ_PREFIX = "sink_seq:"
+SINK_AT_META = "sink_at"
+# /记忆补沉 每批折多少条原文（本地切批，与 recent_messages 的取窗无关）
+BACKFILL_BATCH = 20
 
-def auto_sink_summary(rows) -> str:
+
+def auto_sink_summary(rows, anchor="") -> str:
     """把几轮原文折成一条记忆正文（纯规则，不调模型）。
 
     只做摘要与关键词，不改写原文、不许当结论引用；原文链一直都在，
-    这条只是「这几轮聊了什么」的索引。
+    这条只是「这几轮聊了什么」的索引。anchor 非空时追加在末尾
+    （_sink_anchor 生成的原文引用锚），索引得能指回原文；主体先按
+    4000 字截断，锚永远完整。
     """
     rows = list(rows or [])
     if not rows:
@@ -239,7 +250,10 @@ def auto_sink_summary(rows) -> str:
         len(rows), sum(1 for r in rows if r.get("role") == "user"), head)
     if keywords:
         text += "；关键词：" + "、".join(keywords)
-    return text[:4000]
+    text = text[:4000]
+    if anchor:
+        text += anchor
+    return text
 
 
 class FailureCounter:
@@ -357,6 +371,11 @@ class MemoryCommitPlugin(Star):
         st = self.ledger.stats()
         logger.info("[记忆账本] 已挂载 %s，HEAD=%s，记忆 %d 条" % (
             DB_PATH, st["head"] or "-", st["memories"]))
+        if AUTO_SINK_EVERY > 0:
+            logger.info("[记忆账本] 自动沉淀开：每 %d 轮" % AUTO_SINK_EVERY)
+        else:
+            logger.info("[记忆账本] 自动沉淀关（未设 JJ_MEMORY_AUTO_SINK_EVERY），"
+                        "可用 /记忆补沉 手动补")
 
     # ------------------------------------------------------------------
     # 工具函数
@@ -386,6 +405,10 @@ class MemoryCommitPlugin(Star):
         auto_sink_ids 精确匹配），建图侧被 ledger.is_machine_tag 拦下——
         沉淀条目一条 concept 边也不织，不会把「聊过什么」
         的索引连成图谱上的语义同源。
+
+        G1 水位线：捞原文的 after_seq 改用 _sink_watermark（meta 里
+        持久化的「沉到第几条」），重启/换实例都不会从 0 重沉历史；
+        成功后把水位推到这批原文的链尾并记下沉淀时间。
         """
         if AUTO_SINK_EVERY <= 0:
             return {}
@@ -393,11 +416,12 @@ class MemoryCommitPlugin(Star):
         if self._turn_since_sink < AUTO_SINK_EVERY:
             return {}
         rows = self.ledger.recent_messages(limit=AUTO_SINK_EVERY * 2,
-                                           after_seq=self._last_sink_seq,
+                                           after_seq=self._sink_watermark(session_id),
                                            session_id=session_id)
         if not rows:
             return {}
-        summary = auto_sink_summary(rows)
+        summary = auto_sink_summary(rows,
+                                    anchor=self._sink_anchor(rows, session_id))
         if not summary:
             return {}
         # 自动写入收口：沉淀必须在 restricted_auto_write 范围内执行。
@@ -410,9 +434,108 @@ class MemoryCommitPlugin(Star):
                 tags="%s,%s" % (AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG),
                 importance=0.45, scope_key=session_id,
                 speaker_id=speaker_id, speaker_name=speaker_name)
-        self._last_sink_seq = max(int(r["seq"]) for r in rows)
+        # 成功后推进水位线并记下沉淀时间；_last_sink_seq 保留赋值
+        # （内存口径的「上次沉到哪」，老调用方/观测还认它）。
+        new_wm = max(int(r["seq"]) for r in rows)
+        self._last_sink_seq = new_wm
+        self._write_sink_marks(session_id, new_wm)
         self._turn_since_sink = 0
         return res
+
+    def _sink_watermark(self, session_id: str = "",
+                        default_to_latest: bool = True) -> int:
+        """取某会话的沉淀水位线（原文链 seq），没有就初始化成链尾。
+
+        水位线存 meta（键 SINK_SEQ_PREFIX+session_id），跨重启/跨实例
+        都在。无值时：default_to_latest=True（自动沉淀路径）用
+        latest_message_seq() 起算并落 meta——绝不能从 0 起算，那会把
+        整条历史重沉一遍；=False（/记忆自检、/记忆补沉）返回 0 且不落
+        meta：自检要如实报「未建索引」，补沉本来就是要捞水位之前的
+        历史，捞到后由补沉自己落水位。
+        初始化落库失败只记 failure 不抛：本次仍按链尾算，下次再试。
+        """
+        key = SINK_SEQ_PREFIX + (session_id or "")
+        raw = self.ledger.meta_get(key)
+        if raw:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+        if not default_to_latest:
+            return 0
+        seq = self.ledger.latest_message_seq()
+        try:
+            self.ledger.meta_set(key, str(seq))
+        except Exception as e:
+            self._note_failure("沉淀水位初始化失败", e)
+        return seq
+
+    def _write_sink_marks(self, session_id: str, new_wm: int) -> None:
+        """沉淀成功后写回水位线与上次沉淀时间；失败只记不抛。
+
+        水位写回失败时，下轮会按旧水位重捞同一段原文，可能折出重复
+        索引——记 failure 提醒，但不连累聊天（自动路径本来就不抛）。
+        """
+        try:
+            self.ledger.meta_set(SINK_SEQ_PREFIX + (session_id or ""),
+                                 str(int(new_wm)))
+            self.ledger.meta_set(SINK_AT_META,
+                                 time.strftime("%Y-%m-%dT%H:%M:%S",
+                                               time.localtime()))
+        except Exception as e:
+            self._note_failure("沉淀水位写回失败", e)
+
+    def _sink_anchor(self, rows, session_id: str = "") -> str:
+        """从这批原文取引用锚：「（原文 seq a–b · 会话 s · 时间 t1→t2）」。
+
+        沉淀条目是索引不是事实，索引得能指回原文：正文尾部带上
+        「折的是哪几条、哪个会话、什么时间段」，/记忆原话 能顺着
+        seq 查回原话。rows 为空返回空串；单条原文只写一个 seq；
+        会话号超过 40 字截断；时间取 at 的「年-月-日 时：分」。
+        """
+        rows = list(rows or [])
+        if not rows:
+            return ""
+        seqs = [int(r.get("seq") or 0) for r in rows]
+        a, b = min(seqs), max(seqs)
+        seg = ("原文 seq %d" % a) if a == b else ("原文 seq %d–%d" % (a, b))
+        sess = session_id or ""
+        if sess:
+            if len(sess) > 40:
+                sess = sess[:40] + "…"
+            seg += " · 会话 " + sess
+        at0 = (rows[0].get("at") or "")
+        at1 = (rows[-1].get("at") or "")
+        if at0 or at1:
+            seg += " · 时间 %s→%s" % (at0[:16].replace("T", " ") or "?",
+                                     at1[:16].replace("T", " ") or "?")
+        return "（%s）" % seg
+
+    def _sink_gap_line(self) -> str:
+        """/记忆自检 里的沉淀观测行：开关状态 · 未建索引数 · 上次沉淀时间。
+
+        未建索引数 = 对 message_sessions() 每会话用其水位算
+        count_messages_after 求和；这里取水位按「无值算 0、不落
+        meta」的口径（如实报全部没折过的原文，自检保持只读）。
+        无会话原文走全局口径（不过滤），与 _auto_sink 对空 session
+        的行为一致。统计炸了显示「?」并记 failure，不让自检本身挂掉。
+        """
+        if AUTO_SINK_EVERY > 0:
+            mode = "每 %d 轮" % AUTO_SINK_EVERY
+        else:
+            mode = "关闭（JJ_MEMORY_AUTO_SINK_EVERY 未设）"
+        total = "?"
+        try:
+            total = sum(
+                self.ledger.count_messages_after(
+                    self._sink_watermark(s["session_id"],
+                                         default_to_latest=False),
+                    session_id=s["session_id"])
+                for s in self.ledger.message_sessions())
+        except Exception as e:
+            self._note_failure("沉淀统计失败", e)
+        last = self.ledger.meta_get(SINK_AT_META) or "无"
+        return "沉淀：%s · 未建索引 %s 条 · 上次沉淀 %s" % (mode, total, last)
 
     def _log_injection(self, outcome: str, query_len: int = 0,
                        stats: dict = None, result: dict = None,
@@ -694,10 +817,101 @@ class MemoryCommitPlugin(Star):
             st["schema_version"], "可写" if res["export_ok"] else "没写"))
         lines.append("写路径异常 %d 次：%s" % (self.failures.total(),
                                             self.failures.summary()))
+        lines.append(self._sink_gap_line())
         if res["problems"]:
             lines.append("")
             lines.extend("- " + p for p in res["problems"])
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("记忆补沉")
+    async def cmd_sink_backfill(self, event: AstrMessageEvent):
+        """把水位线之后的原文补折成索引：/记忆补沉 [批数]（owner only）
+
+        自动沉淀关着漏下的、或水位异常漏掉的原文，用这条手动补：
+        逐会话取水位（无水位按 0 起算——就是要捞历史），先 count
+        定量、一次性把该会话水位之后的原文全捞，再本地按 20 条切批
+        折索引（recent_messages 只取「最新的 limit 条」，固定 20 条
+        循环会漏掉最旧的；全捞后从最旧的开始折，一批不漏）。写法与
+        _auto_sink 完全同口径（同标签/级别/重要性、带 anchor、
+        restricted_auto_write 内写），每批推进该会话水位并记 sink_at。
+        默认 20 批，上限 100。
+        """
+        if not _is_owner(event):
+            yield event.plain_result(OWNER_DENY_TEXT)
+            return
+        raw = (event.get_message_str() or "").replace("记忆补沉", "", 1)
+        found = re.search(r"(\d+)", raw)
+        budget = 20 if not found else min(100, max(1, int(found.group(1))))
+        try:
+            sessions = self.ledger.message_sessions()
+        except Exception as e:
+            self._note_failure("补沉列会话失败", e)
+            yield event.plain_result("补沉失败：列会话出错（已计数，看 /记忆自检）")
+            return
+        total_batches = 0
+        total_rows = 0
+        wm_start_min = None
+        wm_end_max = None
+        for s in sessions:
+            sid = s.get("session_id") or ""
+            if total_batches >= budget:
+                break
+            wm = self._sink_watermark(sid, default_to_latest=False)
+            # recent_messages 只会取「最新的 limit 条」，直接循环
+            # limit=20 在积压超过一批时会漏掉最旧的原文（水位一推，
+            # 旧的永远在水位后面）。所以先 count 定量，一次性把
+            # 该会话水位之后的原文全捞（正序），本地按 20 条切批、
+            # 从最旧的开始折——一批不漏，预算用尽时水位停在已折处，
+            # 下次补沉接着往下补。
+            try:
+                n_pending = self.ledger.count_messages_after(wm, session_id=sid)
+            except Exception as e:
+                self._note_failure("补沉计数失败", e)
+                continue
+            if n_pending <= 0:
+                continue
+            try:
+                pending = self.ledger.recent_messages(limit=n_pending,
+                                                      after_seq=wm,
+                                                      session_id=sid)
+            except Exception as e:
+                self._note_failure("补沉取原文失败", e)
+                continue
+            for i in range(0, len(pending), BACKFILL_BATCH):
+                if total_batches >= budget:
+                    break
+                rows = pending[i:i + BACKFILL_BATCH]
+                summary = auto_sink_summary(rows,
+                                            anchor=self._sink_anchor(rows, sid))
+                if not summary:
+                    break
+                try:
+                    with self.ledger.restricted_auto_write():
+                        self.ledger.remember(
+                            summary, level="day",
+                            tags="%s,%s" % (AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG),
+                            importance=0.45, scope_key=sid)
+                except Exception as e:
+                    self._note_failure("补沉写索引失败", e)
+                    break
+                new_wm = max(int(r["seq"]) for r in rows)
+                self._write_sink_marks(sid, new_wm)
+                total_batches += 1
+                total_rows += len(rows)
+                if wm_start_min is None or wm < wm_start_min:
+                    wm_start_min = wm
+                if wm_end_max is None or new_wm > wm_end_max:
+                    wm_end_max = new_wm
+                wm = new_wm
+        if total_rows <= 0:
+            yield event.plain_result("没有待补的原文")
+            return
+        if wm_start_min == wm_end_max:
+            seg = "水位 seq %d" % wm_start_min
+        else:
+            seg = "水位 seq %d→%d" % (wm_start_min, wm_end_max)
+        yield event.plain_result("补沉完成：%d 批 %d 条，%s" % (
+            total_batches, total_rows, seg))
 
     def _persona_import(self, text: str) -> str:
         """解析并写入手写人格，返回给人看的一句话。
@@ -866,6 +1080,15 @@ class MemoryCommitPlugin(Star):
         try:
             said = (event.get_message_str() or "").strip()
             if said:
+                # G1：沉淀开着时，在本轮 user 原文落链前确保水位线存在——
+                # 首轮从「本轮之前」的链尾起算：本轮 user+assistant 都算
+                # 待沉，而库里的历史不会被从 0 重沉。初始化炸了只计数，
+                # _auto_sink 里还有兜底初始化，不连累落链。
+                if AUTO_SINK_EVERY > 0:
+                    try:
+                        self._sink_watermark(event.unified_msg_origin or "")
+                    except Exception as e:
+                        self._note_failure("沉淀水位初始化失败", e)
                 node = self.ledger.append_message(
                     "user", said, session_id=(event.unified_msg_origin or ""))
                 # v5 增量原文锚：这句原话的链上序号，本轮若写了记忆就锚回它

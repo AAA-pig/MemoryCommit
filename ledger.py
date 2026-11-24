@@ -2311,6 +2311,24 @@ class Ledger:
         cx.execute("INSERT INTO meta(k, v) VALUES(?, ?)"
                    " ON CONFLICT(k) DO UPDATE SET v = excluded.v", (key, str(value)))
 
+    def meta_get(self, key: str, default: str = "") -> str:
+        """读 meta 表一个键（只读封装，复用内部 _meta）。
+
+        给沉淀水位线这类跨实例元数据用：键不存在或值为空都算「没有」，
+        返回 default。读拿连接锁，不会撞进别人写事务的中间态。
+        """
+        with self._lock:
+            v = self._meta(self._conn, key)
+        return v if v else default
+
+    def meta_set(self, key: str, value: str) -> None:
+        """写 meta 表一个键（自带一个独立事务，复用 _set_meta）。
+
+        一个键一次提交，失败整条回滚；调用方不用自己包 _tx。
+        """
+        with self._tx() as cx:
+            self._set_meta(cx, key, value)
+
     def _query_one(self, sql: str, params: tuple = ()) -> Optional[sqlite3.Row]:
         # 读也要拿同一把锁：连接是共享的（check_same_thread=False），
         # 写那边有事务，读这边裸奔就可能读进别人的事务中间态。
@@ -3539,6 +3557,43 @@ class Ledger:
         params.append(max(1, int(limit)))
         rows = self._query_all(sql, tuple(params))
         return [dict(r) for r in reversed(rows)]
+
+    def latest_message_seq(self) -> int:
+        """原文链当前最大 seq，空链返回 0。
+
+        给沉淀水位线初始化用：第一次取水位从链尾起算并落 meta，
+        不能从 0 起算——那会把整条历史重沉一遍。
+        """
+        row = self._query_one("SELECT MAX(seq) AS m FROM message")
+        return int(row["m"] or 0) if row else 0
+
+    def message_sessions(self) -> List[Dict[str, Any]]:
+        """按会话聚合原文链：每行 session_id / n / first_seq / last_seq。
+
+        COALESCE(session_id,'') 让无会话（空串）也聚成一行，不会漏；
+        按 last_seq 倒序，最近活跃的会话排前面。给自检算「未建索引」
+        与 /记忆补沉 逐会话推进水位用。
+        """
+        rows = self._query_all(
+            "SELECT COALESCE(session_id,'') AS session_id, COUNT(*) AS n,"
+            " MIN(seq) AS first_seq, MAX(seq) AS last_seq"
+            " FROM message GROUP BY COALESCE(session_id,'')"
+            " ORDER BY last_seq DESC")
+        return [dict(r) for r in rows]
+
+    def count_messages_after(self, after_seq: int = 0, session_id: str = "") -> int:
+        """数原文链里 seq 大于 after_seq 的条数；session_id 非空只数该会话。
+
+        口径与 recent_messages 一致：session_id 空串 = 不过滤（含所有
+        会话）。给自检算「未建索引条数」：每会话拿它的水位数一遍再求和。
+        """
+        sql = "SELECT COUNT(*) AS n FROM message WHERE seq > ?"
+        params: List[Any] = [int(after_seq or 0)]
+        if session_id:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        row = self._query_one(sql, tuple(params))
+        return int(row["n"] or 0) if row else 0
 
     def search_messages(self, query: str = "", limit: int = 10,
                         session_id: str = "", since: str = "",

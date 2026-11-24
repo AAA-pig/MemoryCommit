@@ -76,18 +76,22 @@ except ModuleNotFoundError:
 #   profile_visibility_of（可见性查询，缺行按 private）、
 #   get_attitude / get_attitude_detail（坏感度读取，失败按 0 不阻塞聊天）。
 #   读接口全部无写库。经本轮任务评审入清单。
+#   G1 沉淀水位线：meta_get / meta_set（meta 表元数据读写封装）、
+#   latest_message_seq / message_sessions / count_messages_after
+#   （原文链只读统计，给自检「未建索引」与 /记忆补沉 用）。
+#   经评审入清单（tasks 20261115-172409）。
 LEDGER_PUBLIC_METHODS = frozenset({
     "access_history", "activate", "add_persona", "add_persona_batch", "anchor_memory", "append_message",
     "auto_sink_ids",
-    "classify_pair", "close", "commit", "compact", "current_status",
+    "classify_pair", "close", "commit", "compact", "count_messages_after", "current_status",
     "denial_history", "denied_ids", "deny_memory", "deny_revoke", "disputed_ids",
     "dream_add_memory",
     "dream_apply", "dream_produced_ids", "dump_jsonl", "export_markdown",
     "flush", "flush_plan", "forget", "get_attitude", "get_attitude_detail", "get_creative", "head", "health_check", "history",
-    "list_creatives", "list_persona", "load_jsonl", "materialize", "max_created_seq",
+    "latest_message_seq", "list_creatives", "list_persona", "load_jsonl", "materialize", "max_created_seq",
     "max_persona_no", "maybe_checkpoint_wal",
-    "maybe_export_daily", "maybe_rebalance_working_set", "message_stats",
-    "nominate_node", "pending_denial_queue", "persona_text", "plan_working_set",
+    "maybe_export_daily", "maybe_rebalance_working_set", "message_sessions", "message_stats",
+    "meta_get", "meta_set", "nominate_node", "pending_denial_queue", "persona_text", "plan_working_set",
     "profile_visibility_of", "profiles",
     "propose_clues", "prune_access_log", "queue_denial_suspect", "quiet_ids",
     "rebalance_working_set", "recall", "recent_messages", "remember",
