@@ -7,7 +7,6 @@
 
 import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 
@@ -17,6 +16,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import ledger as L  # noqa: E402
+
+LEGACY_LEDGER_1_5_0 = os.path.join(ROOT, "tests", "fixtures", "ledger_1_5_0.py")
 
 
 def _load_module_from_source(source: str, name: str, tmp_path) -> object:
@@ -34,20 +35,19 @@ def _load_module_from_source(source: str, name: str, tmp_path) -> object:
 
 @pytest.fixture()
 def legacy_ledger_db(tmp_path):
-    """用 1.5.0 末期 的 ledger.py 写一个 1.5.0 形态的库再交出去。
+    """用 1.5.0 时期的 ledger.py 固定快照写一个 1.5.0 形态的库再交出去。
 
-    1.5.0 期间（1.5.0 末期两波）的 _auto_sink 写 tags=「自动沉淀」，
+    1.5.0 期间的 _auto_sink 写 tags=「自动沉淀」，
     没有 type:auto_sink 类型标记；旧版 _auto_link 会给这个标签织
     concept 边。这里照旧外壳的真实写路径造出同样的数据形态。
     """
     try:
-        src = subprocess.run(["git", "show", "1.5.0 末期:ledger.py"], cwd=ROOT,
-                             capture_output=True, check=True,
-                             timeout=30).stdout.decode("utf-8")
-    except Exception as e:  # pragma: no cover - 环境坏了要显式暴露
-        pytest.fail("取不到 1.5.0 末期:ledger.py（%r）：这条测试钉的是存量迁移，"
-                    "评审基线提交必须在本地历史里" % e)
-    old = _load_module_from_source(src, "ledger_1.5.0 末期", tmp_path)
+        with open(LEGACY_LEDGER_1_5_0, encoding="utf-8") as f:
+            src = f.read()
+    except OSError as e:  # pragma: no cover - 环境坏了要显式暴露
+        pytest.fail("读不到固定快照 %s（%r）：这条测试钉的是存量迁移，"
+                    "夹具必须随仓库提供" % (LEGACY_LEDGER_1_5_0, e))
+    old = _load_module_from_source(src, "ledger_1_5_0", tmp_path)
     db = str(tmp_path / "legacy.db")
     led = old.Ledger(db)
     led.remember("空调遥控器放在电视柜第二个抽屉", importance=0.5)
@@ -59,7 +59,7 @@ def legacy_ledger_db(tmp_path):
 
 
 def test_n6_legacy_auto_sink_migrated_on_open(legacy_ledger_db):
-    """用 1.5.0 末期 写库、新代码打开：存量沉淀被补标记、机器标签边被摘除。
+    """用 1.5.0 时期的快照写库、新代码打开：存量沉淀被补标记、机器标签边被摘除。
 
     修复前（评审复现）：auto_sink_ids() 为空、15 条 concept=自动沉淀
     的边还在、activate("空调") 返回的全是沉淀、渲染出的系统提示里

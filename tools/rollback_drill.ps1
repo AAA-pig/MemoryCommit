@@ -48,7 +48,7 @@ dirty、python 与 pytest 版本。脚本一改，旧报告就对不上，先看
 param(
     [string]$RepoRoot,
     [string]$BackupDir,
-    [string]$RollbackTarget = "1.5.1 上线版",
+    [string]$RollbackTarget,
     [string]$Python,
     [string]$OutDir,
     [switch]$DryRun,
@@ -58,6 +58,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
+if (-not $RollbackTarget) { throw "请用 -RollbackTarget 指定回滚点提交（历史重写后硬编码哈希会失效）" }
 if (-not $BackupDir) { $BackupDir = Join-Path $RepoRoot ("backups\2026-11-14-" + $RollbackTarget) }
 if (-not $OutDir) { $OutDir = Join-Path $RepoRoot "tools\drill_out" }
 
