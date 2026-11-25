@@ -1,7 +1,7 @@
 # schema 5 → 6 升级方案（含演练结果与回滚条件）
 
 > 对象：`astrbot_plugin_memory_commit`，库 `%USERPROFILE%\.local\share\jingjing-memory\ledger.db`
-> 代码版本：`schema6 定版`（`SCHEMA_VERSION = 6`）
+> 代码版本：`1149e3b`（`SCHEMA_VERSION = 6`）
 > 定稿时间：2026-11-15
 > 结论先说：**真库已经是 v6 了**（见第 1 节实测），本文档里的「升级顺序」因此从「待执行」变成「照单核对」；演练部分仍然有效，用于证明这套流程本身是安全的。
 
@@ -77,7 +77,7 @@ missing_rows:
   m3|m1|记忆账本
   m3|m2|记忆账本
   m4|m3|方向
-  m4|m3|用户交代
+  m4|m3|老大交代
   m4|m3|脱离AstrBot
   m5|m3|脱离AstrBot
   m5|m4|脱离AstrBot
@@ -114,7 +114,7 @@ missing_rows: 与 A 组逐条相同（同样是上面那 7 条）
 m3|m1|记忆账本     由 C8  insert，链里没有对应的 delete
 m3|m2|记忆账本      由 C8  insert，链里没有对应的 delete
 m4|m3|方向         由 C10 insert，链里没有对应的 delete
-m4|m3|用户交代      由 C10 insert，链里没有对应的 delete
+m4|m3|老大交代      由 C10 insert，链里没有对应的 delete
 m4|m3|脱离AstrBot  由 C10 insert，链里没有对应的 delete
 m5|m3|脱离AstrBot  由 C14 insert，链里没有对应的 delete
 m5|m4|脱离AstrBot  由 C14 insert，链里没有对应的 delete
@@ -239,7 +239,7 @@ python drill_link_diff.py (Join-Path $tmp 'work.db')
 
 ### 第 4 步：换代码并重载
 
-把 `schema6 定版` 的插件目录就位，重新启用插件。首次加载会自动完成 5→6（若还没升）。
+把 `1149e3b` 的插件目录就位，重新启用插件。首次加载会自动完成 5→6（若还没升）。
 
 ### 第 5 步：验证（逐条打勾，缺一条都不算过）
 
@@ -295,7 +295,7 @@ python probe_health.py '<副本路径>'                                         
 1. 再次卸载插件 / 停止写入（必须，否则覆盖库文件时正在写）。确认没有进程再持有 `ledger.db`：`-shm` 不再被打开、mtime 停止变化。
 2. 记账：把当前 `schema_version` / `head` / `commit_no` / 各表行数抄进值班本。回滚会丢掉这段历史，事后要能说清丢了哪些提交。
 3. **先把库整套覆盖回 v5**：用第 1 步的三件套备份原样拷回，`.db` + `-wal` + `-shm` **三件一起替换，不许只换 `.db`**（只换 `.db` 会丢 WAL 里未 checkpoint 的事务，等于凭空丢记忆）。覆盖完先只读核一遍：`schema_version = 5`、没有 `creative` 表（`mode=ro` 探库，别加 `immutable=1`，见第 0 节）。
-4. **再退代码**：代码退回升级前那个提交（本次是 `schema6 定版` 之前，即 `升级前提交`）。**必须在库已回退到 v5 之后执行；顺序颠倒会导致插件打不开库**——v5 代码打开 v6 库时，`Ledger._migrate` 会立刻抛 `LedgerError：账本结构版本 6 比当前代码支持的 5 还新，先升级代码再打开`，插件直接加载失败。
+4. **再退代码**：代码退回升级前那个提交（本次是 `1149e3b` 之前，即 `fd33b2b`）。**必须在库已回退到 v5 之后执行；顺序颠倒会导致插件打不开库**——v5 代码打开 v6 库时，`Ledger._migrate` 会立刻抛 `LedgerError：账本结构版本 6 比当前代码支持的 5 还新，先升级代码再打开`，插件直接加载失败。
 5. 重新启用，按第 5 步重跑验证（此时 `schema_version` 应为 5、无 `creative` 表）。
 
 **为什么只能库先退、代码后退**：两个方向的兼容性不对称。
@@ -308,7 +308,7 @@ python probe_health.py '<副本路径>'                                         
 
 - **降级方向不可逆**：v5 代码不认识「版本比我新」的库会拒绝打开（`LedgerError`），所以回滚只能是**库先退、代码后退**，顺序颠倒会直接开不了库，见上面第 4 条；
 - **会丢升级后新增的记忆**：库退回备份点，之后写入的提交（本次若已发生过，是 C96…C101）全部消失；
-- **回滚演练的 tests 口径（已修正）**：`tools/rollback_drill.ps1` 场景 B 早前只按 `git ls-tree <回滚点> -- tests` 的名单**删除**回滚点之后新增的测试文件、不还原同名文件的旧内容。于是 `tests/test_ledger.py`、`tests/test_memory_duty.py` 这类在 `schema6 定版` 被改过的文件会带着新断言去跑旧代码，必然红——那是脚本口径造成的假红，不是回滚点不健康（旧版实跑：B 470 收集 / 3 failed，`test_schema_is_v5`、`test_migration_seeds_access_log`、`test_public_api_frozen_no_extra_write_path`）。现已改为删掉副本的 `tests/` 后 `git checkout <回滚点> -- tests` 整套还原，`lost_cases` 也改成「回滚点相对当前 test 集合的净丢失用例数」（按收集到的 node id 集合差算，不是收集总数相减）。场景 A 不受影响，仍只覆盖代码、留着当前 tests。B 再红时会先比对副本 tests 与回滚点是否逐文件一致，一致才判「真回归」；
+- **回滚演练的 tests 口径（已修正）**：`tools/rollback_drill.ps1` 场景 B 早前只按 `git ls-tree <回滚点> -- tests` 的名单**删除**回滚点之后新增的测试文件、不还原同名文件的旧内容。于是 `tests/test_ledger.py`、`tests/test_memory_duty.py` 这类在 `1149e3b` 被改过的文件会带着新断言去跑旧代码，必然红——那是脚本口径造成的假红，不是回滚点不健康（旧版实跑：B 470 收集 / 3 failed，`test_schema_is_v5`、`test_migration_seeds_access_log`、`test_public_api_frozen_no_extra_write_path`）。现已改为删掉副本的 `tests/` 后 `git checkout <回滚点> -- tests` 整套还原，`lost_cases` 也改成「回滚点相对当前 test 集合的净丢失用例数」（按收集到的 node id 集合差算，不是收集总数相减）。场景 A 不受影响，仍只覆盖代码、留着当前 tests。B 再红时会先比对副本 tests 与回滚点是否逐文件一致，一致才判「真回归」；
 
 ---
 

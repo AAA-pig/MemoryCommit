@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 <#
 覆盖率门禁：统计 ledger.py / main.py 的行 + 分支双 100%，conftest.py 单独标注。
 
@@ -58,9 +58,8 @@ $dataFile = Join-Path $RepoRoot ".coverage"
 if (-not $KeepData -and (Test-Path $dataFile)) { Remove-Item $dataFile -Force }
 
 # 生产门禁文件：conftest.py 是测试夹具，默认不进总账
-# 2026-11-15：persona_text.py（手写人格纯文本解析）并入生产门禁——
-# 它是随插件发布的解析逻辑，不是测试夹具，解析错一行就会写进错误的人格。
-$gateFiles = @("ledger.py", "main.py", "persona_text.py")
+# 手写人格解析已并入 persona_cmd.py，随该文件计入生产门禁。
+$gateFiles = @("ledger.py", "main.py", "persona_cmd.py")
 if ($IncludeConftest) { $gateFiles += "conftest.py" }
 $gateInclude = ($gateFiles -join ",")
 

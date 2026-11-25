@@ -37,7 +37,12 @@ _SKIP_DIRS = {".venv", ".git", "__pycache__", ".pytest_cache", "node_modules"}
 
 
 def _project_py_files():
-    for p in sorted(PROJECT_ROOT.rglob("*.py")):
+    paths = []
+    for folder, dirs, files in os.walk(PROJECT_ROOT):
+        paths.extend(pathlib.Path(folder, name) for name in dirs + files
+                     if pathlib.Path(name).match("*.py"))
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+    for p in sorted(paths):
         if any(part in _SKIP_DIRS for part in p.parts):
             continue
         yield p

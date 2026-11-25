@@ -144,7 +144,7 @@ class DreamDutyTest(unittest.TestCase):
         self.assertLessEqual(L.DREAM_MAX_OUTPUTS, 2)
 
     def test_dream_output_has_no_source_anchor(self):
-        """梦产出没有原文，不是证据——锚必须为空（用户一句话就能删）。"""
+        """梦产出没有原文，不是证据——锚必须为空（老大一句话就能删）。"""
         self._seed(2)
         ids = [r["id"] for r in self.led.propose_clues("爬山", limit=2)]
         res = self.led.dream_add_memory("（梦）山道上应该有人卖水", basis_ids=ids)

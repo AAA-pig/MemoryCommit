@@ -14,6 +14,7 @@
 """
 
 import ast
+import os
 import pathlib
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -37,28 +38,33 @@ CORE_RULE_WRITE_SQL = (
 
 # (文件, 函数) -> 这里是哪一处 core_rule 落库
 ALLOWED_CORE_RULE_WRITES = {
-    ("ledger.py", "add_persona"): "CommitBuilder.add_persona：唯一 insert 口",
-    ("ledger.py", "update_persona"): "CommitBuilder.update_persona：唯一 update 口",
-    ("ledger.py", "remove_persona"): "CommitBuilder.remove_persona：唯一 delete 口",
-    ("ledger.py", "_migrate_6_to_7"): "结构迁移：ALTER TABLE 补 kind/source/updated_at",
+    ("ledger_commit.py", "add_persona"): "CommitBuilder.add_persona：唯一 insert 口",
+    ("ledger_commit.py", "update_persona"): "CommitBuilder.update_persona：唯一 update 口",
+    ("ledger_commit.py", "remove_persona"): "CommitBuilder.remove_persona：唯一 delete 口",
+    ("ledger_schema.py", "_migrate_6_to_7"): "结构迁移：ALTER TABLE 补 kind/source/updated_at",
 }
 
 # (文件, 函数) -> 这里会调人格写方法。每个都得说清「凭什么它是用户路径」
 ALLOWED_PERSONA_CALLERS = {
-    ("ledger.py", "add_persona"): "门面层：开 user_persona_write('api') 后转 builder",
-    ("ledger.py", "update_persona"): "门面层：开 user_persona_write('api') 后转 builder",
-    ("ledger.py", "remove_persona"): "门面层：开 user_persona_write('api') 后转 builder",
-    ("ledger.py", "add_persona_batch"): "手写导入门面：开 user_persona_write('handwrite')，整批一个提交",
-    ("ledger.py", "_seed_persona_core"): "显式播种：开 user_persona_write('seed')",
-    ("main.py", "cmd_persona"): "/人格 命令：用户显式发起",
-    ("main.py", "_persona_import"): "/人格 导入 的公共壳：用户显式发起，转 add_persona_batch",
+    ("ledger_persona.py", "add_persona"): "门面层：开 user_persona_write('api') 后转 builder",
+    ("ledger_persona.py", "update_persona"): "门面层：开 user_persona_write('api') 后转 builder",
+    ("ledger_persona.py", "remove_persona"): "门面层：开 user_persona_write('api') 后转 builder",
+    ("ledger_persona.py", "add_persona_batch"): "手写导入门面：开 user_persona_write('handwrite')，整批一个提交",
+    ("ledger_persona.py", "_seed_persona_core"): "显式播种：开 user_persona_write('seed')",
+    ("persona_cmd.py", "persona_reply"): "/人格 的文案分发：查/加/改/删，用户显式发起（cmd_persona 只转交）",
+    ("persona_cmd.py", "persona_import"): "/人格 导入 的公共壳：用户显式发起，转 add_persona_batch",
     ("main.py", "memory_persona"): "memory_persona 工具：用户显式发起",
 }
 
 
 def _sources():
     """仓库里的生产源文件（根目录的 .py，跳过测试与产物目录）。"""
-    for path in sorted(ROOT.rglob("*.py")):
+    paths = []
+    for folder, dirs, files in os.walk(ROOT):
+        paths.extend(pathlib.Path(folder, name) for name in dirs + files
+                     if pathlib.Path(name).match("*.py"))
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+    for path in sorted(paths):
         parts = set(path.relative_to(ROOT).parts[:-1])
         if parts & SKIP_DIRS:
             continue

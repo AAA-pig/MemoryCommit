@@ -2,7 +2,7 @@
 """手写人格导入（/人格 导入）：纯文本解析 + 整批一个提交。
 
 分两层：
-  解析层（persona_text.parse_persona_text）是主体——纯函数，出错必须说清
+  解析层（persona_cmd.parse_persona_text）是主体——纯函数，出错必须说清
   第几行、错在哪，不能让人自己数到眼花。
   写入层只验三件事：整批一个提交、闸没被绕过、core 分区写不进。
   其余写入口行为由 test_persona / test_persona_token 钉住，不在这里重复。
@@ -15,7 +15,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import ledger as L  # noqa: E402
-import persona_text as PT  # noqa: E402
+import persona_cmd as PT  # noqa: E402
 
 
 class ParseTest(unittest.TestCase):

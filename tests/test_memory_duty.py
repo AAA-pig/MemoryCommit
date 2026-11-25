@@ -280,7 +280,7 @@ class MemoryDutyTest(unittest.TestCase):
 
     def test_classifier_perspective_two_samples(self):
         self.assertEqual(L.classify_conflict("那次项目黄了是因为需求变了", "那次项目黄了是因为排期太赶",
-                                             None, None, "用户", "我"),
+                                             None, None, "老大", "我"),
                          L.CONFLICT_PERSPECTIVE)
         a, b = self._pair("我记得是他先动的手", "我记得是她先开口的")
         res = self.led.classify_pair(a, b, a_perspective="他", b_perspective="她")

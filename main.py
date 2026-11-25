@@ -25,21 +25,41 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 try:
-    from .ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
-                         AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
-                         ATTITUDE_OWNER_ID,
-                         Ledger, LedgerError, StaleHeadError, match_denial_keywords,
-                         render_persona_rows,
-                         tokenize)
-    from .persona_text import parse_persona_text
+    from .ledger import (
+        GRADES, LEVELS, DEFAULT_INJECT_SLOTS, AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
+        ATTITUDE_OWNER_ID, Ledger, LedgerError, StaleHeadError, match_denial_keywords,
+        render_persona_rows, tokenize,
+    )
+    from .persona_cmd import (
+        parse_persona_text, PERSONA_FILES_DIR, PERSONA_FILE_MAX, read_persona_file,
+        persona_reply,
+    )
+    from .sink import (
+        FailureCounter, _short, _as_text, _as_int, _as_float, _fmt_hit, auto_sink_summary,
+        sink_anchor, access_text, activate_text, history_text, raw_text, recall_text,
+        status_text,
+    )
 except ImportError:  # 直接当脚本跑时
-    from ledger import (GRADES, LEVELS, DEFAULT_INJECT_SLOTS,
-                        AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
-                        ATTITUDE_OWNER_ID,
-                        Ledger, LedgerError, StaleHeadError, match_denial_keywords,
-                        render_persona_rows,
-                        tokenize)
-    from persona_text import parse_persona_text
+    from ledger import (
+        GRADES, LEVELS, DEFAULT_INJECT_SLOTS, AUTO_SINK_LABEL, AUTO_SINK_TYPE_TAG,
+        ATTITUDE_OWNER_ID, Ledger, LedgerError, StaleHeadError, match_denial_keywords,
+        render_persona_rows, tokenize,
+    )
+    from persona_cmd import (
+        parse_persona_text, PERSONA_FILES_DIR, PERSONA_FILE_MAX, read_persona_file,
+        persona_reply,
+    )
+    from sink import (
+        FailureCounter, _short, _as_text, _as_int, _as_float, _fmt_hit, auto_sink_summary,
+        sink_anchor, access_text, activate_text, history_text, raw_text, recall_text,
+        status_text,
+    )
+
+if __package__:
+    from . import memory_commands as _memory_commands, sink as _sink
+else:
+    import memory_commands as _memory_commands
+    import sink as _sink
 
 PLUGIN_NAME = "astrbot_plugin_memory_commit"
 # 版本号单一来源是 metadata.yaml；这里与之保持一致（一致性由
@@ -52,11 +72,6 @@ DATA_DIR = Path(os.environ.get(
 DB_PATH = DATA_DIR / "ledger.db"
 EXPORT_PATH = DATA_DIR / "记忆账本.md"
 BACKUP_DIR = DATA_DIR / "backup"
-# 人格资料目录：/人格 导入文件 只读这里。放在插件目录下，跟插件一起走；
-# 目录不存在没关系，边界校验会先于「找文件」拦下一切越界路径。
-PERSONA_FILES_DIR = Path(__file__).resolve().parent / "persona_files"
-# 手写导入的文件大小上限（A1 保留原有 128KB 口径）
-PERSONA_FILE_MAX = 128 * 1024
 # 人格注入预算：与 ledger.persona_text 默认值同口径（降级渲染复用）
 PERSONA_INJECT_BUDGET = 1200
 # 人格段围栏（A3）：人格是「资料」不是指令，包一层说清楚。
@@ -114,6 +129,16 @@ def _is_owner(event) -> bool:
     return event.unified_msg_origin in _load_owners()
 
 
+def _arg_after(event) -> str:
+    """指令名之后的整段原文（没有参数就是空串）。
+
+    指令行里第一个 token 是指令名，后面原样留下——带空格的关键词不必加引号。
+    """
+    raw = (event.get_message_str() or "").strip()
+    parts = raw.split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 # 非 owner 时指令与工具统一的拒答文案
 OWNER_DENY_TEXT = "不可用：记忆账本只在用户和助手的私聊里开放。"
 
@@ -139,46 +164,12 @@ def _sender_of(event) -> tuple:
     return sid[:64], name[:64]
 
 
-def _read_persona_file(arg: str) -> str:
-    """从人格资料目录读一个手写人格文件，返回文件内容。
 
-    路径边界六道闸（A1/C1）：NUL、软链接、越界、非普通文件、
-    128KB 上限、UTF-8 解码失败。相对路径一律按 PERSONA_FILES_DIR
-    解析（C1：命令提示用户只给文件名，按进程 CWD 找等于坏的）；
-    绝对路径保持原样。规则是先把 resolve(strict=True) 后的真实路径
-    对进 PERSONA_FILES_DIR，再谈读不读——参数是用户发来的，不能拿
-    它去摸插件目录之外的任何东西。
-    所有拒绝都转成 LedgerError 的人话，不抛未捕获异常。
-    """
-    raw = str(arg or "").strip().strip('"').strip("'")
-    if not raw:
-        raise LedgerError("给个人格资料目录里的文件名")
-    if "\x00" in raw:
-        raise LedgerError("路径里有非法字符（NUL），不读")
-    path = Path(raw)
-    base = PERSONA_FILES_DIR.resolve()
-    candidate = path if path.is_absolute() else base / path
-    if candidate.is_symlink():
-        raise LedgerError("软链接不读：%s" % candidate)
-    try:
-        real = candidate.resolve(strict=True)
-    except FileNotFoundError:
-        raise LedgerError("没找到文件：%s（人格资料目录：%s）" % (raw, base))
-    except OSError as e:
-        raise LedgerError("这个路径打不开：%s" % e)
-    if real != base and not real.is_relative_to(base):
-        raise LedgerError("只能读人格资料目录（%s）里的文件：%s 不在里面"
-                          % (base, raw))
-    if real.is_dir():
-        raise LedgerError("这是个目录不是文件：%s" % raw)
-    if not real.is_file():
-        raise LedgerError("没找到文件：%s（人格资料目录：%s）" % (raw, base))
-    if real.stat().st_size > PERSONA_FILE_MAX:
-        raise LedgerError("文件超过 128KB：手写导入装不下，先拆。")
-    try:
-        return real.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError) as e:
-        raise LedgerError("读不了这个文件：%s" % e)
+def _read_persona_file(arg: str) -> str:
+    """薄适配层：目录走本模块的 PERSONA_FILES_DIR（测试会 patch 它），
+    边界与读取的实现在 persona_files.read_persona_file。"""
+    return read_persona_file(arg, base=PERSONA_FILES_DIR, max_bytes=PERSONA_FILE_MAX)
+
 
 # 画像块隔多久才注入一次。每轮都念同样的「用户的事」反而吵，默认一小时。
 PROFILE_REFRESH_SECONDS = int(os.environ.get("JJ_MEMORY_PROFILE_REFRESH", "3600") or 3600)
@@ -213,132 +204,6 @@ SINK_SEQ_PREFIX = "sink_seq:"
 SINK_AT_META = "sink_at"
 # /记忆补沉 每批折多少条原文（本地切批，与 recent_messages 的取窗无关）
 BACKFILL_BATCH = 20
-
-
-def auto_sink_summary(rows, anchor="") -> str:
-    """把几轮原文折成一条记忆正文（纯规则，不调模型）。
-
-    只做摘要与关键词，不改写原文、不许当结论引用；原文链一直都在，
-    这条只是「这几轮聊了什么」的索引。anchor 非空时追加在末尾
-    （_sink_anchor 生成的原文引用锚），索引得能指回原文；主体先按
-    4000 字截断，锚永远完整。
-    """
-    rows = list(rows or [])
-    if not rows:
-        return ""
-    said = " ".join((r.get("content") or "") for r in rows if r.get("role") == "user")
-    if not said:
-        said = " ".join((r.get("content") or "") for r in rows)
-    said = " ".join(said.split())
-    counts = {}
-    for tok in tokenize(said):
-        if len(tok) < 2:
-            continue
-        counts[tok] = counts.get(tok, 0) + 1
-    keywords = []
-    for tok, _n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-        if any(tok in k for k in keywords):
-            continue
-        keywords.append(tok)
-        if len(keywords) >= 5:
-            break
-    head = said if len(said) <= 60 else said[:60] + "…"
-    # 正文不再带字面前缀「自动沉淀：」（N9）：「这是什么」已由 tags 里的
-    # 机器标记表达，正文重复一次只会让「自动」「沉淀」这些词面在检索里
-    # 命中一切沉淀条目，把普通事实挤出词面排序。
-    text = "最近 %d 条原文（用户 %d 条）。开头是「%s」" % (
-        len(rows), sum(1 for r in rows if r.get("role") == "user"), head)
-    if keywords:
-        text += "；关键词：" + "、".join(keywords)
-    text = text[:4000]
-    if anchor:
-        text += anchor
-    return text
-
-
-class FailureCounter:
-    """写路径异常计数（内存即可）。
-
-    以前失败只留一行 warning，重载后什么都不剩；计数能让 /记忆自检 说清
-    「哪条写路径在悄悄失败」。不落盘：重启归零本来就是应该的。
-    """
-
-    def __init__(self):
-        self.counts = {}
-        self.last = {}
-
-    def note(self, kind: str, err: Any) -> int:
-        self.counts[kind] = self.counts.get(kind, 0) + 1
-        self.last[kind] = str(err)[:160]
-        return self.counts[kind]
-
-    def total(self) -> int:
-        return sum(self.counts.values())
-
-    def summary(self) -> str:
-        if not self.counts:
-            return "无"
-        return "；".join("%s %d 次" % (k, v) for k, v in sorted(self.counts.items()))
-
-
-def _short(text: str, n: int = 40) -> str:
-    text = " ".join((text or "").split())
-    return text if len(text) <= n else text[:n] + "…"
-
-
-# LLM 工具的参数不是人填的表格：可能是 null、数字、带空格的串、甚至
-# 「很高」这种。入库口（ledger）会拦，但拦的方式是抛异常，异常从工具里
-# 溢出去就是整条回复炸掉。所以在这一层先把参数收干净。
-
-def _as_text(value: Any, name: str = "内容", limit: int = 0) -> str:
-    text = "" if value is None else str(value).strip()
-    if not text:
-        raise LedgerError("%s不能为空" % name)
-    if limit and len(text) > limit:
-        text = text[:limit]
-    return text
-
-
-def _as_int(value: Any, default: int, low: int = 0, high: int = 0) -> int:
-    try:
-        n = int(value)
-    except (TypeError, ValueError, OverflowError):
-        # OverflowError：int(float("inf")) 这种（N4）。
-        n = default
-    if low:
-        n = max(low, n)
-    if high:
-        n = min(high, n)
-    return n
-
-
-def _as_float(value: Any, default: float) -> float:
-    try:
-        n = float(value)
-    except (TypeError, ValueError):
-        return default
-    if n != n or n in (float("inf"), float("-inf")):
-        return default
-    return n
-
-
-def _fmt_hit(m: dict, idx: int = 0) -> str:
-    tag = "·"
-    match = str(m.get("match", ""))
-    if match.startswith("graph"):
-        tag = "↗"
-    elif match.startswith("clue"):
-        tag = "⌁"
-    elif match.startswith("direct+clue"):
-        tag = "·"
-    head = "%d. %s %s" % (idx, tag, _short(m["summary"], 56))
-    tail = "   %s / %s / 分 %.2f" % (m["id"], GRADES.get(int(m["grade"]), "?"), m["score"])
-    if m.get("clue_boost"):
-        tail += " · 线索 +%.0f%%" % (float(m["clue_boost"]) * 100)
-    if m.get("disputed"):
-        # R3：显式检索也标出争议，别让被否认的记忆看起来和普通记忆一样可信
-        tail += " · 有争议（被否认过，待对证）"
-    return head + tail
 
 
 @register(PLUGIN_NAME, "助手", "带提交链和分层检索的外置记忆账本", PLUGIN_VERSION)
@@ -421,7 +286,7 @@ class MemoryCommitPlugin(Star):
         if not rows:
             return {}
         summary = auto_sink_summary(rows,
-                                    anchor=self._sink_anchor(rows, session_id))
+                                    anchor=sink_anchor(rows, session_id))
         if not summary:
             return {}
         # 自动写入收口：沉淀必须在 restricted_auto_write 范围内执行。
@@ -454,21 +319,7 @@ class MemoryCommitPlugin(Star):
         历史，捞到后由补沉自己落水位。
         初始化落库失败只记 failure 不抛：本次仍按链尾算，下次再试。
         """
-        key = SINK_SEQ_PREFIX + (session_id or "")
-        raw = self.ledger.meta_get(key)
-        if raw:
-            try:
-                return int(raw)
-            except (TypeError, ValueError):
-                pass
-        if not default_to_latest:
-            return 0
-        seq = self.ledger.latest_message_seq()
-        try:
-            self.ledger.meta_set(key, str(seq))
-        except Exception as e:
-            self._note_failure("沉淀水位初始化失败", e)
-        return seq
+        return _sink._sink_watermark(self, session_id, default_to_latest, SINK_SEQ_PREFIX)
 
     def _write_sink_marks(self, session_id: str, new_wm: int) -> None:
         """沉淀成功后写回水位线与上次沉淀时间；失败只记不抛。
@@ -476,40 +327,12 @@ class MemoryCommitPlugin(Star):
         水位写回失败时，下轮会按旧水位重捞同一段原文，可能折出重复
         索引——记 failure 提醒，但不连累聊天（自动路径本来就不抛）。
         """
-        try:
-            self.ledger.meta_set(SINK_SEQ_PREFIX + (session_id or ""),
-                                 str(int(new_wm)))
-            self.ledger.meta_set(SINK_AT_META,
-                                 time.strftime("%Y-%m-%dT%H:%M:%S",
-                                               time.localtime()))
-        except Exception as e:
-            self._note_failure("沉淀水位写回失败", e)
+        return _sink._write_sink_marks(
+            self, session_id, new_wm, SINK_AT_META, SINK_SEQ_PREFIX, time)
 
     def _sink_anchor(self, rows, session_id: str = "") -> str:
-        """从这批原文取引用锚：「（原文 seq a–b · 会话 s · 时间 t1→t2）」。
-
-        沉淀条目是索引不是事实，索引得能指回原文：正文尾部带上
-        「折的是哪几条、哪个会话、什么时间段」，/记忆原话 能顺着
-        seq 查回原话。rows 为空返回空串；单条原文只写一个 seq；
-        会话号超过 40 字截断；时间取 at 的「年-月-日 时：分」。
-        """
-        rows = list(rows or [])
-        if not rows:
-            return ""
-        seqs = [int(r.get("seq") or 0) for r in rows]
-        a, b = min(seqs), max(seqs)
-        seg = ("原文 seq %d" % a) if a == b else ("原文 seq %d–%d" % (a, b))
-        sess = session_id or ""
-        if sess:
-            if len(sess) > 40:
-                sess = sess[:40] + "…"
-            seg += " · 会话 " + sess
-        at0 = (rows[0].get("at") or "")
-        at1 = (rows[-1].get("at") or "")
-        if at0 or at1:
-            seg += " · 时间 %s→%s" % (at0[:16].replace("T", " ") or "?",
-                                     at1[:16].replace("T", " ") or "?")
-        return "（%s）" % seg
+        """薄适配层：实现在 sink.sink_anchor（纯函数，测试也认这个名字）。"""
+        return sink_anchor(rows, session_id)
 
     def _sink_gap_line(self) -> str:
         """/记忆自检 里的沉淀观测行：开关状态 · 未建索引数 · 上次沉淀时间。
@@ -520,22 +343,7 @@ class MemoryCommitPlugin(Star):
         无会话原文走全局口径（不过滤），与 _auto_sink 对空 session
         的行为一致。统计炸了显示「?」并记 failure，不让自检本身挂掉。
         """
-        if AUTO_SINK_EVERY > 0:
-            mode = "每 %d 轮" % AUTO_SINK_EVERY
-        else:
-            mode = "关闭（JJ_MEMORY_AUTO_SINK_EVERY 未设）"
-        total = "?"
-        try:
-            total = sum(
-                self.ledger.count_messages_after(
-                    self._sink_watermark(s["session_id"],
-                                         default_to_latest=False),
-                    session_id=s["session_id"])
-                for s in self.ledger.message_sessions())
-        except Exception as e:
-            self._note_failure("沉淀统计失败", e)
-        last = self.ledger.meta_get(SINK_AT_META) or "无"
-        return "沉淀：%s · 未建索引 %s 条 · 上次沉淀 %s" % (mode, total, last)
+        return _sink._sink_gap_line(self, AUTO_SINK_EVERY, SINK_AT_META)
 
     def _log_injection(self, outcome: str, query_len: int = 0,
                        stats: dict = None, result: dict = None,
@@ -547,59 +355,9 @@ class MemoryCommitPlugin(Star):
         extra: 可附带 long_prompt / prompt_len 等观测字段。
         超过 INJECT_LOG_ROTATE_LINES 行就轮转成 inject-log.1.jsonl。
         """
-        try:
-            line = {
-                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()),
-                "outcome": outcome,
-                "query_len": int(query_len),
-                "budget": self.BRIEF_BUDGET,
-                "inject_slots": self.INJECT_SLOTS,
-                "working_capacity": self.ledger.working_capacity,
-            }
-            if extra:
-                line.update(extra)
-            if stats:
-                line.update(stats)
-            if result:
-                line["route"] = result.get("route", "")
-                line["picked"] = len(result.get("items") or [])
-            INJECT_LOG.parent.mkdir(parents=True, exist_ok=True)
-            # 轮转：写前看计数器，攒够阈值就把当前文件改名成 .1，重开一份。
-            self._inject_lines += 1
-            if self._inject_lines > INJECT_LOG_ROTATE_LINES:
-                try:
-                    backup = INJECT_LOG.with_suffix(".1.jsonl")
-                    if backup.exists():
-                        backup.unlink()
-                    os.replace(str(INJECT_LOG), str(backup))
-                    # 新文件已经重开，下面这一行马上要写进它：计数置 1 对齐实际行数。
-                    # 置 0 会永久少 1，文件要到 5001 行才轮转；重启靠文件行数初始化才自愈。
-                    self._inject_lines = 1
-                except Exception as e:
-                    self._note_failure("注入日志轮转失败", e)
-            with open(INJECT_LOG, "a", encoding="utf-8") as f:
-                f.write(json.dumps(line, ensure_ascii=False) + "\n")
-        except Exception as e:
-            self._note_failure("注入日志写失败", e)
-
-    def _status_text(self) -> str:
-        st = self.ledger.stats()
-        grade = " / ".join("%s %d" % (k, v) for k, v in st["by_grade"].items())
-        level = " / ".join("%s %d" % (k, v) for k, v in st["by_level"].items()) or "空"
-        return (
-            "记忆账本\n"
-            "HEAD %s · 创建序号 %d\n"
-            "记忆 %d 条（%s）\n"
-            "分层：%s\n"
-            "工作记忆 %d/%d 个名额\n"
-            "线索 %d 个 · 连边 %d 条 · 画像 %d 条\n"
-            "提交 %d 个 · 库 %.0f KB"
-            % (st["head"] or "（空）", st["created_seq"], st["memories"], grade,
-               level,
-               st["by_grade"].get("一级", 0), st["working_capacity"],
-               st["clues"], st["links"], st["profiles"],
-               st["commits"], st["db_bytes"] / 1024.0)
-        )
+        return _memory_commands._log_injection(
+            self, outcome, query_len, stats, result, INJECT_LOG, INJECT_LOG_ROTATE_LINES,
+            json, os, time, **extra)
 
     # ------------------------------------------------------------------
     # 指令
@@ -611,19 +369,11 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").strip()
-        arg = raw.split(None, 1)[1].strip() if len(raw.split(None, 1)) > 1 else ""
+        arg = _arg_after(event)
         if not arg:
-            yield event.plain_result(self._status_text())
+            yield event.plain_result(status_text(self.ledger.stats()))
             return
-        hits = self.ledger.recall(arg, limit=5)
-        if not hits:
-            yield event.plain_result("账本里没有和「%s」沾边的记忆。" % _short(arg, 16))
-            return
-        lines = ["关于「%s」：" % _short(arg, 16), ""]
-        for i, m in enumerate(hits, 1):
-            lines.append(_fmt_hit(m, i))
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(recall_text(arg, self.ledger.recall(arg, limit=5)))
 
     @filter.command("记忆链")
     async def cmd_history(self, event: AstrMessageEvent):
@@ -631,14 +381,7 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        rows = self.ledger.history(10)
-        if not rows:
-            yield event.plain_result("还没有任何提交。")
-            return
-        lines = ["最近提交：", ""]
-        for r in rows:
-            lines.append("%s %s  （%d 行）" % (r["id"], _short(r["message"], 34), r["rows"]))
-        yield event.plain_result("\n".join(lines))
+        yield event.plain_result(history_text(self.ledger.history(10)))
 
     @filter.command("记忆冲刷")
     async def cmd_flush(self, event: AstrMessageEvent):
@@ -646,31 +389,8 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "")
-        # 破坏性操作要精确确认（R1）：只认独立的「确认」一词。
-        # 不许用「确认 in raw」——「不要确认」也含「确认」，会误执行。
-        confirm = "确认" in raw.split()
-        if not confirm:
-            plan = self.ledger.flush_plan()
-            if not plan:
-                yield event.plain_result("冲刷量全是 0，没有该掉的记忆。")
-                return
-            lines = ["待处理 %d 条（发送「/记忆冲刷 确认」执行）：" % len(plan), ""]
-            for item in plan[:8]:
-                verb = "淘汰" if item["action"] == "delete" else "降级"
-                lines.append("%s %s · 冲刷量 %d · 压力 %.1f\n   %s" % (
-                    item["memory_id"], verb, item["flush_amount"],
-                    item["pressure"], _short(item["summary"], 30)))
-            if len(plan) > 8:
-                lines.append("…还有 %d 条" % (len(plan) - 8))
-            yield event.plain_result("\n".join(lines))
-            return
-        res = self.ledger.flush(apply=True)
-        if not res.get("applied"):
-            yield event.plain_result("这次没什么要冲的。")
-            return
-        yield event.plain_result("冲完了：降级 %d 条，淘汰 %d 条。HEAD 现在是 %s。" % (
-            res["demoted"], res["deleted"], res["commit"]))
+        async for result in _memory_commands.cmd_flush(self, event, _short):
+            yield result
 
     @filter.command("记忆容量")
     async def cmd_working(self, event: AstrMessageEvent):
@@ -678,37 +398,8 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").replace("记忆容量", "", 1)
-        # 精确确认（R1）：「确认」必须是独立词，「不要确认」不算
-        confirm = "确认" in raw.split()
-        found = re.search(r"(\d+)", " ".join(t for t in raw.split() if t != "确认"))
-        cap = int(found.group(1)) if found else None
-        if cap is not None:  # 改了名额就记在这一趟里，重载后回到环境变量
-            self.ledger.working_capacity = max(0, cap)
-        if not confirm:
-            plan = self.ledger.plan_working_set()
-            lines = ["工作记忆 %d/%d 个名额：%s" % (
-                plan["occupied"], plan["capacity"],
-                "（容量关着，grade 不会自己变）" if plan["capacity"] <= 0 else "")]
-            for i, item in enumerate(plan["keep"], 1):
-                lines.append("%d. %s %s · 清楚度 %.2f\n   %s" % (
-                    i, item["id"], item.get("seat", "一级"), item["activation"],
-                    _short(item["summary"], 40)))
-            if not plan["keep"]:
-                lines.append("（还没有一级记忆）")
-            if plan["overflow"]:
-                lines.append("")
-                lines.append("超员 %d 条，发「/记忆容量 确认」把最弱的降成零级" % plan["overflow"])
-            for item in plan["promote"]:
-                lines.append("＋ %s 最近被反复想起，会升回一级" % item["id"])
-            yield event.plain_result("\n".join(lines))
-            return
-        res = self.ledger.rebalance_working_set(apply=True)
-        if not res.get("applied"):
-            yield event.plain_result("名额没超，也没人该复活，不用换班。")
-            return
-        yield event.plain_result("换完班了：降 %d 条，升 %d 条。HEAD 现在是 %s。" % (
-            len(res["demoted"]), len(res["promoted"]), res["commit"]))
+        async for result in _memory_commands.cmd_working(self, event, _short, re):
+            yield result
 
     @filter.command("记忆压缩")
     async def cmd_compact(self, event: AstrMessageEvent):
@@ -716,36 +407,9 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").replace("记忆压缩", "", 1)
-        # 破坏性操作要精确确认（R1，评审复测：/记忆压缩 1 一直无确认直接执行）：
-        # 只认独立的「确认」一词，与 /记忆冲刷、/记忆容量 同一口径。
-        confirm = "确认" in raw.split()
-        found = re.search(r"(\d+)", " ".join(t for t in raw.split() if t != "确认"))
-        keep = max(1, int(found.group(1))) if found else 10
-        if not confirm:
-            commits = int(self.ledger.stats()["commits"])
-            if commits <= 1:
-                yield event.plain_result("只有 %d 个提交，没什么可压的。" % commits)
-                return
-            yield event.plain_result(
-                "压缩会把最早的提交并成一条基线，不可逆（现在 %d 个提交，保留最近 %d 个）。\n"
-                "发送「/记忆压缩%s确认」执行。" % (
-                    commits, keep, " %d " % keep if found else " "))
-            return
-        try:
-            res = self.ledger.compact(keep_recent=keep)
-        except (LedgerError, StaleHeadError) as e:
-            yield event.plain_result("没压成：%s" % e)
-            return
-        if not res.get("compacted"):
-            yield event.plain_result("%s，现在一共 %d 个提交。" % (
-                res.get("reason", "不用压缩"), res.get("commits", 0)))
-            return
-        yield event.plain_result(
-            "压好了：最早的 %d 个提交并成一条基线（%d 行快照），保留最近 %d 个。\n"
-            "现在一共 %d 个提交，HEAD 还是 %s。" % (
-                res["merged"], res["baseline_rows"], res["kept"],
-                res["commits"], res["head"]))
+        async for result in _memory_commands.cmd_compact(
+            self, event, LedgerError, StaleHeadError, re):
+            yield result
 
     @filter.command("记忆导出")
     async def cmd_export(self, event: AstrMessageEvent):
@@ -767,34 +431,9 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").strip()
-        parts = raw.split(None, 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        # 客户端只传文件名：不管传来的是绝对路径还是带 .. 的相对路径，
-        # 都只留最后的文件名部分，再校验解析后路径确实落在专用目录里
-        name = os.path.basename(arg.replace("\\", "/")).strip() if arg else ""
-        if name in ("", ".", ".."):
-            name = "ledger-%s.jsonl" % time.strftime("%Y%m%d-%H%M%S")
-        if not name.lower().endswith(".jsonl"):
-            name += ".jsonl"
-        try:
-            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-            target = BACKUP_DIR / name
-            base_real = Path(os.path.realpath(str(BACKUP_DIR)))
-            target_real = Path(os.path.realpath(str(target)))
-            if target_real != base_real and not target_real.is_relative_to(base_real):
-                raise LedgerError("备份只能写进专用目录：%s" % BACKUP_DIR)
-            if target_real.exists():
-                raise LedgerError("同名备份已存在，默认不覆盖，换个文件名再发")
-            self.ledger.dump_jsonl(str(target_real))
-        except Exception as e:
-            yield event.plain_result("没备份成：%s" % e)
-            return
-        st = self.ledger.stats()
-        yield event.plain_result(
-            "备份好了：\n%s\n\n提交 %d · 记忆 %d · 线索 %d · 结构版本 %d" % (
-                target_real, st["commits"], st["memories"], st["clues"],
-                st["schema_version"]))
+        async for result in _memory_commands.cmd_backup(
+            self, event, BACKUP_DIR, LedgerError, Path, os, time):
+            yield result
 
     @filter.command("记忆自检")
     async def cmd_health(self, event: AstrMessageEvent):
@@ -802,26 +441,8 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        res = self.ledger.health_check(str(EXPORT_PATH))
-        st = res["stats"]
-        lines = ["记忆账本自检：%s" % ("通过" if res["ok"] else "有问题")]
-        lines.append("HEAD %s · 提交 %d · 记忆 %d · 线索 %d · 连边 %d" % (
-            st["head"] or "（空）", st["commits"], st["memories"],
-            st["clues"], st["links"]))
-        lines.append("访问痕迹 %d 条（不占提交链）" % st.get("accesses", 0))
-        chain = res.get("message_chain") or {}
-        lines.append("原文链 %d 条 · 链校验：%s" % (
-            chain.get("count", 0),
-            "通过" if chain.get("ok") else "断裂"))
-        lines.append("结构版本 v%d · 导出：%s" % (
-            st["schema_version"], "可写" if res["export_ok"] else "没写"))
-        lines.append("写路径异常 %d 次：%s" % (self.failures.total(),
-                                            self.failures.summary()))
-        lines.append(self._sink_gap_line())
-        if res["problems"]:
-            lines.append("")
-            lines.extend("- " + p for p in res["problems"])
-        yield event.plain_result("\n".join(lines))
+        async for result in _memory_commands.cmd_health(self, event, EXPORT_PATH):
+            yield result
 
     @filter.command("记忆补沉")
     async def cmd_sink_backfill(self, event: AstrMessageEvent):
@@ -839,97 +460,10 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").replace("记忆补沉", "", 1)
-        found = re.search(r"(\d+)", raw)
-        budget = 20 if not found else min(100, max(1, int(found.group(1))))
-        try:
-            sessions = self.ledger.message_sessions()
-        except Exception as e:
-            self._note_failure("补沉列会话失败", e)
-            yield event.plain_result("补沉失败：列会话出错（已计数，看 /记忆自检）")
-            return
-        total_batches = 0
-        total_rows = 0
-        wm_start_min = None
-        wm_end_max = None
-        for s in sessions:
-            sid = s.get("session_id") or ""
-            if total_batches >= budget:
-                break
-            wm = self._sink_watermark(sid, default_to_latest=False)
-            # recent_messages 只会取「最新的 limit 条」，直接循环
-            # limit=20 在积压超过一批时会漏掉最旧的原文（水位一推，
-            # 旧的永远在水位后面）。所以先 count 定量，一次性把
-            # 该会话水位之后的原文全捞（正序），本地按 20 条切批、
-            # 从最旧的开始折——一批不漏，预算用尽时水位停在已折处，
-            # 下次补沉接着往下补。
-            try:
-                n_pending = self.ledger.count_messages_after(wm, session_id=sid)
-            except Exception as e:
-                self._note_failure("补沉计数失败", e)
-                continue
-            if n_pending <= 0:
-                continue
-            try:
-                pending = self.ledger.recent_messages(limit=n_pending,
-                                                      after_seq=wm,
-                                                      session_id=sid)
-            except Exception as e:
-                self._note_failure("补沉取原文失败", e)
-                continue
-            for i in range(0, len(pending), BACKFILL_BATCH):
-                if total_batches >= budget:
-                    break
-                rows = pending[i:i + BACKFILL_BATCH]
-                summary = auto_sink_summary(rows,
-                                            anchor=self._sink_anchor(rows, sid))
-                if not summary:
-                    break
-                try:
-                    with self.ledger.restricted_auto_write():
-                        self.ledger.remember(
-                            summary, level="day",
-                            tags="%s,%s" % (AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG),
-                            importance=0.45, scope_key=sid)
-                except Exception as e:
-                    self._note_failure("补沉写索引失败", e)
-                    break
-                new_wm = max(int(r["seq"]) for r in rows)
-                self._write_sink_marks(sid, new_wm)
-                total_batches += 1
-                total_rows += len(rows)
-                if wm_start_min is None or wm < wm_start_min:
-                    wm_start_min = wm
-                if wm_end_max is None or new_wm > wm_end_max:
-                    wm_end_max = new_wm
-                wm = new_wm
-        if total_rows <= 0:
-            yield event.plain_result("没有待补的原文")
-            return
-        if wm_start_min == wm_end_max:
-            seg = "水位 seq %d" % wm_start_min
-        else:
-            seg = "水位 seq %d→%d" % (wm_start_min, wm_end_max)
-        yield event.plain_result("补沉完成：%d 批 %d 条，%s" % (
-            total_batches, total_rows, seg))
-
-    def _persona_import(self, text: str) -> str:
-        """解析并写入手写人格，返回给人看的一句话。
-
-        解析在 persona_text（纯函数），写入在 Ledger.add_persona_batch
-        （带闸、整批一个提交）。这里只负责把结果翻成人话。
-        """
-        res = parse_persona_text(text)
-        if res["problems"]:
-            return "这批没写：\n" + "\n".join(
-                "- " + p for p in res["problems"][:8])
-        try:
-            ids = self.ledger.add_persona_batch(res["items"], source="handwrite")
-        except LedgerError as e:
-            return "没写上：%s" % e
-        head = self.ledger.head()
-        shown = "、".join(ids[:8]) + ("…" if len(ids) > 8 else "")
-        return "已手写写入 %d 条自我设定：%s（一个提交 %s）" % (len(ids), shown, head)
+        async for result in _sink.cmd_sink_backfill(
+            self, event, AUTO_SINK_TAG, AUTO_SINK_TYPE_TAG, BACKFILL_BATCH,
+            auto_sink_summary, re, sink_anchor):
+            yield result
 
     def _persona_text_without_core(self) -> str:
         """封印异常时的降级渲染：core 段整段不进 system prompt。
@@ -955,102 +489,10 @@ class MemoryCommitPlugin(Star):
         raw = (event.get_message_str() or "").strip()
         parts = raw.split(None, 1)
         rest = parts[1].strip() if len(parts) > 1 else ""
-        sub, arg = "", ""
-        if rest:
-            sp = rest.split(None, 1)
-            sub = sp[0].strip()
-            arg = sp[1].strip() if len(sp) > 1 else ""
-        if sub in ("", "查", "列表", "list"):
-            rows = self.ledger.list_persona()
-            if not rows:
-                yield event.plain_result("还没有任何人格设定（基础设定未播种，自我设定也没有）。")
-                return
-            lines = ["人格设定：", ""]
-            for r in rows:
-                tag = "基础·只读" if r["kind"] == "core" else "自我"
-                lines.append("%s [%s · 权重 %d] %s" % (
-                    r["id"], tag, int(r["priority"]),
-                    _short(r["content"], 60)))
-            yield event.plain_result("\n".join(lines))
-            return
-        if sub in ("加", "新增", "add"):
-            if not arg:
-                yield event.plain_result("用法：/人格 加 内容（一句话，200 字内）")
-                return
-            try:
-                pid = self.ledger.add_persona("self", arg)
-            except LedgerError as e:
-                yield event.plain_result("没加上：%s" % e)
-                return
-            yield event.plain_result("已新增自我设定 %s（提交 %s）" % (
-                pid, self.ledger.head()))
-            return
-        if sub in ("导入", "手写", "import"):
-            if not arg:
-                yield event.plain_result(
-                    "用法：/人格 导入 一行一条；[权重] 前缀可省，整批一个提交。\n"
-                    "例：/人格 导入\n[50] 认准的事会坚持\n说话短句为主\n"
-                    "以 # 开头的行是注释。要读文件用 /人格 导入文件 路径")
-                return
-            yield event.plain_result(self._persona_import(arg))
-            return
-        if sub in ("导入文件", "导入文本", "importfile"):
-            if not arg:
-                yield event.plain_result(
-                    "用法：/人格 导入文件 文件名（只读人格资料目录 %s）\n"
-                    "例：/人格 导入文件 persona.txt" % PERSONA_FILES_DIR)
-                return
-            try:
-                text = _read_persona_file(arg)
-            except Exception as e:
-                yield event.plain_result("读不了：%s" % e)
-                return
-            yield event.plain_result(self._persona_import(text))
-            return
-        if sub in ("改", "更新", "update"):
-            if not arg:
-                yield event.plain_result(
-                    "用法：/人格 改 p1 新内容 [权重N]（只改权重时可省内容）")
-                return
-            sp = arg.split(None, 1)
-            rid = sp[0].strip()
-            rest_arg = sp[1].strip() if len(sp) > 1 else ""
-            m = re.search(r"权重\s*(\d+)\s*$", rest_arg)
-            prio = int(m.group(1)) if m else None
-            content_part = rest_arg[:m.start()].strip() if m else rest_arg
-            if not content_part and prio is None:
-                yield event.plain_result("没说要改什么：给新内容或权重（权重N）。")
-                return
-            try:
-                ok = self.ledger.update_persona(
-                    rid, content=content_part or None, priority=prio)
-            except LedgerError as e:
-                yield event.plain_result("没改成：%s" % e)
-                return
-            if not ok:
-                yield event.plain_result("没改成：设定 %s 不存在或内容没变。" % rid)
-                return
-            yield event.plain_result("已更新设定 %s（提交 %s）" % (
-                rid, self.ledger.head()))
-            return
-        if sub in ("删", "删除", "remove"):
-            rid = arg.strip()
-            if not rid:
-                yield event.plain_result("用法：/人格 删 p1")
-                return
-            try:
-                ok = self.ledger.remove_persona(rid)
-            except LedgerError as e:
-                yield event.plain_result("没删掉：%s" % e)
-                return
-            if not ok:
-                yield event.plain_result("没删掉：设定 %s 不存在。" % rid)
-                return
-            yield event.plain_result("已删除设定 %s（提交 %s）" % (
-                rid, self.ledger.head()))
-            return
-        yield event.plain_result(
-            "不认识的子命令：%s。可用：查 / 加 / 改 / 删，直接发「/人格」看全部。" % sub)
+        # 文案与分发在 persona_cmd；目录与读文件口按调用当时从本模块取，
+        # 测试 patch main.PERSONA_FILES_DIR 才生效。
+        yield event.plain_result(persona_reply(
+            self, rest, files_dir=PERSONA_FILES_DIR, read_file=_read_persona_file))
 
     # ------------------------------------------------------------------
     # 唤起：在开口之前先想起点什么
@@ -1067,150 +509,10 @@ class MemoryCommitPlugin(Star):
         """
         if not _is_owner(event) and not _is_group(event):
             return
-        # 原文锚绑在这次请求的事件上（R2），不再挂在插件实例：
-        # 不同会话/并发请求各锚各的，不会串；落链失败显式置 0，
-        # 不许沿用上一轮的锚去锚错原话。
-        anchor_seq = 0
-        # N4：said 也要先置空。get_message_str() 炸掉时它还没被赋值，
-        # 下面长 prompt 分支的 said 会 UnboundLocalError，把「落链失败」
-        # 升级成「唤起失败」，整轮注入直接消失。
-        said = ""
-        # 原文先落链，再谈检索：这条不管后面检索成不成立都得记下。
-        # 检索词有长度上限，原文没有——「记得住」和「想得起」是两件事。
-        try:
-            said = (event.get_message_str() or "").strip()
-            if said:
-                # G1：沉淀开着时，在本轮 user 原文落链前确保水位线存在——
-                # 首轮从「本轮之前」的链尾起算：本轮 user+assistant 都算
-                # 待沉，而库里的历史不会被从 0 重沉。初始化炸了只计数，
-                # _auto_sink 里还有兜底初始化，不连累落链。
-                if AUTO_SINK_EVERY > 0:
-                    try:
-                        self._sink_watermark(event.unified_msg_origin or "")
-                    except Exception as e:
-                        self._note_failure("沉淀水位初始化失败", e)
-                node = self.ledger.append_message(
-                    "user", said, session_id=(event.unified_msg_origin or ""))
-                # v5 增量原文锚：这句原话的链上序号，本轮若写了记忆就锚回它
-                anchor_seq = int(node.get("seq") or 0)
-                # 否认关键词命中 → 只进待确认队列，不自动改状态（v5 §5.1）。
-                # 「你记错了」这种话是线索不是判决，等人或原文对账确认。
-                hits = match_denial_keywords(said)
-                if hits:
-                    try:
-                        self.ledger.queue_denial_suspect(said, keyword=hits[0])
-                    except Exception as e:
-                        self._note_failure("待确认队列写入失败", e)
-        except Exception as e:
-            self._note_failure("原文落链失败", e)
-            anchor_seq = 0
-        try:
-            event._mc_anchor_seq = anchor_seq
-        except Exception:
-            pass
-        raw = (getattr(req, "prompt", "") or "").strip()
-        # 坏感度（B4）：给注入链路的读接口。读失败按 0 处理不阻塞聊天
-        # （get_attitude 内部已吞异常返 0），这一轮先记进注入观测账。
-        speaker_id, _sender_name = _sender_of(event)
-        attitude = self.ledger.get_attitude(speaker_id)
-        # 空提示词就什么都不唤起。
-        if not raw:
-            self._log_injection("empty_prompt", attitude=attitude)
-            return
-        # 长 prompt 不当检索词（可能是拼好的整段上下文），但流程照常走：
-        # 只把 query 置空，让唤起走 fresh 激活路线；导出、换班都不跳过。
-        # 这一轮只记一行注入日志（带 long_prompt=true 和 prompt_len），
-        # 不再单独记一行 long_prompt，否则同一 prompt 写两行、统计翻倍。
-        long_prompt = len(raw) > 300
-        if long_prompt:
-            # 长 prompt 不当检索词（可能是拼好的整段上下文），但用户原话 said
-            # 还能当检索词用：截到 300 字以内再传下去，别让这一轮连词面检索都放弃。
-            # said 也为空时才真置空；300/301 的边界语义保持原样。
-            query = (said or "")[:300]
-        else:
-            query = raw
-        # 维护任务不是每轮都必须做：首轮和之后每 MAINTAIN_EVERY 轮各检查一次。
-        # 写法必须是 (tick - 1) % N == 0（R8）：旧写法 tick % N == 1 在
-        # N=1 时余数恒为 0，条件永远不成立，维护一轮都不会跑。
-        self._maintain_tick += 1
-        if (self._maintain_tick - 1) % MAINTAIN_EVERY == 0:
-            # 每天第一次请求前顺手刷一次 记忆账本.md，不额外挂定时器
-            try:
-                self.ledger.maybe_export_daily(str(EXPORT_PATH))
-            except Exception as e:
-                self._note_failure("每日导出失败", e)
-            # 顺手看一眼工作记忆有没有超员：有冷却，没超员就什么都不做
-            try:
-                self.ledger.maybe_rebalance_working_set()
-            except Exception as e:  # 换班失败也不能影响聊天
-                self._note_failure("工作记忆换班失败", e)
-            # WAL 只涨不落会让库旁边的 -wal 越堆越大：超阈值就截断一次
-            try:
-                self.ledger.maybe_checkpoint_wal()
-            except Exception as e:  # 截断失败不影响聊天
-                self._note_failure("WAL 截断失败", e)
-        try:
-            with_profile = (time.time() - self._profile_injected_at) >= PROFILE_REFRESH_SECONDS
-            # coexist 条件判定需要语境（R3）：至少会话场景与当前时间。
-            # 场景只给真实拿得到的会话标识，拿不到就整体传 None——判不出
-            # 条件的记忆按保守处理（不主动浮现），不许编造环境数据。
-            scene = (event.unified_msg_origin or "").strip()
-            context = {"scene": scene, "now": time.time()} if scene else None
-            # B1：scope_key 落到当前会话——检索、联想、激活都不跨会话；
-            # B3：群聊只注入「关于主人的 public 画像」，owner 私聊给全部
-            # （缺省口径 private，没有可见性行的画像群聊一律不给）。
-            result = self.ledger.activate(query, slots=self.INJECT_SLOTS,
-                                          with_profile=with_profile, context=context,
-                                          scope_key=scene,
-                                          profile_visibility=("public" if _is_group(event) else ""))
-            stats: dict = {}
-            brief = self.ledger.render_brief(result, max_chars=self.BRIEF_BUDGET,
-                                             stats=stats)
-        except Exception as e:  # 唤起失败绝不能影响聊天本身
-            self._note_failure("唤起失败", e)
-            return
-        # 人格分区注入（v7）：人格先于记忆。独立预算（persona_text 自带
-        # 1200 字默认），与 render_brief 互不挤占；整段 try/except，
-        # 人格炸了只记失败原因，回复照常——人格是加分项不是门槛。
-        # A2：注入前先核封印（全项目第三处校验点，前两处在启动与自检）。
-        # 封印不符或缺失时 core 段整段不注入、self 分区照常；失败进
-        # 失败计数不许静默；不自动重封、不改库——修封印是人工的事
-        # （ reseal_persona_core(confirm=True) ）。
-        try:
-            seal = self.ledger._verify_persona_core_seal(context="inject")
-        except Exception as e:
-            self._note_failure("人格封印校验失败", e)
-            seal = {"ok": False}
-        try:
-            if seal.get("ok"):
-                persona = self.ledger.persona_text()
-            else:
-                persona = self._persona_text_without_core()
-                self._note_failure(
-                    "人格封印校验未通过，core 段未注入",
-                    LedgerError("core 人格哨兵不符或缺失（meta 存 %r）"
-                                % seal.get("stored", "")))
-        except Exception as e:
-            self._note_failure("人格注入失败", e)
-            persona = ""
-        # A3：人格是资料不是指令——先清 C0/C1 控制字符（保留 \n \t），
-        # 再包上围栏。空人格不围，免得往 system prompt 里塞空壳。
-        persona = _PERSONA_CTRL_RE.sub("", persona)
-        if persona.strip():
-            persona = (PERSONA_FENCE_HEAD + "\n" + persona + "\n"
-                       + PERSONA_FENCE_TAIL)
-        self._log_injection("injected" if brief else "no_hit",
-                            query_len=len(query), stats=stats, result=result,
-                            long_prompt=long_prompt,
-                            prompt_len=len(raw) if long_prompt else 0,
-                            attitude=attitude)
-        if not brief and not persona:
-            return
-        if result.get("profiles"):
-            self._profile_injected_at = time.time()
-        base = getattr(req, "system_prompt", "") or ""
-        body = "\n\n".join(s for s in (persona, brief) if s)
-        req.system_prompt = (base + "\n\n" + body) if base else body
+        return _memory_commands.inject_memory(
+            self, event, req, AUTO_SINK_EVERY, EXPORT_PATH, LedgerError, MAINTAIN_EVERY,
+            PERSONA_FENCE_HEAD, PERSONA_FENCE_TAIL, PROFILE_REFRESH_SECONDS,
+            _PERSONA_CTRL_RE, _is_group, _sender_of, match_denial_keywords, time)
 
     @filter.on_llm_response()
     async def record_reply(self, event: AstrMessageEvent, resp) -> None:
@@ -1221,22 +523,7 @@ class MemoryCommitPlugin(Star):
         """
         if not _is_owner(event) and not _is_group(event):
             return
-        try:
-            text = (getattr(resp, "completion_text", "") or "").strip()
-            if text:
-                self.ledger.append_message(
-                    "assistant", text, session_id=(event.unified_msg_origin or ""))
-        except Exception as e:
-            self._note_failure("回复落链失败", e)
-            return
-        # 沉淀是锦上添花：它炸了只能计数，绝不能连累回复。
-        # B1/B2：只沉本会话原文，scope 落本会话，发送者随沉淀入库。
-        speaker_id, speaker_name = _sender_of(event)
-        try:
-            self._auto_sink(session_id=(event.unified_msg_origin or ""),
-                            speaker_id=speaker_id, speaker_name=speaker_name)
-        except Exception as e:
-            self._note_failure("自动沉淀失败", e)
+        return _memory_commands.record_reply(self, event, resp, _sender_of)
 
     @filter.command("坏感度")
     async def cmd_attitude(self, event: AstrMessageEvent):
@@ -1248,31 +535,9 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").strip()
-        parts = raw.split()
-        if len(parts) < 2:
-            yield event.plain_result(
-                "用法：/坏感度 用户ID → 查；"
-                "/坏感度 用户ID 0到4 [原因] → 设。主人的等级不许设。")
-            return
-        uid = parts[1].strip()
-        if len(parts) == 2:
-            row = self.ledger.get_attitude_detail(uid)
-            reason = "（原因：%s）" % row["reason"] if row["reason"] else "（还没记过）"
-            yield event.plain_result("%s 坏感度 %d%s" % (
-                uid, int(row["level"]), reason))
-            return
-        if uid == ATTITUDE_OWNER_ID:
-            yield event.plain_result("主人的坏感度不许设：owner 的等级严禁修改。")
-            return
-        reason = " ".join(parts[3:]) if len(parts) > 3 else ""
-        try:
-            res = self.ledger.set_attitude(uid, parts[2], reason)
-        except LedgerError as e:
-            yield event.plain_result("没设成：%s" % e)
-            return
-        yield event.plain_result("已把 %s 坏感度设为 %d（提交 %s）" % (
-            uid, res["level"], res["commit"]))
+        async for result in _memory_commands.cmd_attitude(
+            self, event, ATTITUDE_OWNER_ID, LedgerError):
+            yield result
 
     @filter.command("记忆原话")
     async def cmd_raw(self, event: AstrMessageEvent):
@@ -1280,27 +545,10 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").strip()
-        parts = raw.split(None, 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
+        arg = _arg_after(event)
         res = self.ledger.search_messages(arg, limit=8, return_meta=True)
-        rows = res["rows"]
-        if not rows:
-            tip = "（关键词：%s）" % arg if arg else ""
-            tail = ""
-            if res.get("truncated"):
-                tail = "，原文链共 %d 条，只查了最近 %d 条，关键词可能埋在更早的对话里" % (
-                    res["total"], res["scanned"])
-            yield event.plain_result("原文链里没有%s。%s" % (tip, tail))
-            return
-        st = self.ledger.message_stats()
-        lines = ["原文链共 %d 条，最早 %s" % (st["count"], (st["since"] or "-")[:16]), ""]
-        if res.get("truncated"):
-            lines.append("（只查了最近 %d 条原文，没往更早翻）" % res["scanned"])
-        for r in rows:
-            who = "我" if r["role"] == "assistant" else "用户"
-            lines.append("[%s] %s：%s" % (r["at"][11:16], who, r["content"][:160]))
-        yield event.plain_result("\n".join(lines))
+        st = self.ledger.message_stats() if res["rows"] else None
+        yield event.plain_result(raw_text(arg, res, st))
 
     @filter.command("记忆访问")
     async def cmd_access(self, event: AstrMessageEvent):
@@ -1308,25 +556,8 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").strip()
-        parts = raw.split(None, 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        rows = self.ledger.access_history(arg, limit=12)
-        if not rows:
-            yield event.plain_result(
-                "还没有访问痕迹%s。" % ("（%s）" % arg if arg else ""))
-            return
-        lines = ["最近 %d 次被想起：" % len(rows), ""]
-        for r in rows:
-            q = (r.get("query") or "").strip()
-            how = (r.get("how") or "").strip()
-            tail = ""
-            if how.startswith("seed:"):
-                tail = "（迁移前累计 %s 次）" % how.split(":", 1)[1]
-            elif q:
-                tail = "因为「%s」" % q[:16]
-            lines.append("- %s %s %s" % (r["at"][5:16], r["memory_id"], tail))
-        yield event.plain_result("\n".join(lines))
+        arg = _arg_after(event)
+        yield event.plain_result(access_text(arg, self.ledger.access_history(arg, limit=12)))
 
     @filter.command("记忆唤起")
     async def cmd_activate(self, event: AstrMessageEvent):
@@ -1334,27 +565,10 @@ class MemoryCommitPlugin(Star):
         if not _is_owner(event):
             yield event.plain_result(OWNER_DENY_TEXT)
             return
-        raw = (event.get_message_str() or "").strip()
-        parts = raw.split(None, 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-        result = self.ledger.activate(arg, slots=self.INJECT_SLOTS, dry_run=True)
-        if not result["items"] and not result["profiles"]:
-            yield event.plain_result("此刻什么都想不起来（账本可能是空的）。")
-            return
-        lines = ["路线：%s" % result["route"], ""]
-        for r in result["items"]:
-            lines.append("- %s｜%s  [%s 分 %.2f]" % (
-                r.get("how"), _short(r["summary"], 36), r["id"], r["score"]))
-        for p in result["profiles"]:
-            lines.append("用户的事：%s" % _short(p["fact"], 28))
-        lines.append("")
-        lines.append("真要说出口的时候，大概是这样：")
-        lines.append(self.ledger.render_brief(result, max_chars=self.BRIEF_BUDGET))
-        yield event.plain_result("\n".join(lines))
-
-    # ------------------------------------------------------------------
-    # LLM 工具
-    # ------------------------------------------------------------------
+        result = self.ledger.activate(_arg_after(event),
+                                      slots=self.INJECT_SLOTS, dry_run=True)
+        yield event.plain_result(activate_text(
+            result, self.ledger.render_brief(result, max_chars=self.BRIEF_BUDGET)))
 
     @filter.llm_tool(name="memory_write")
     async def memory_write(self, event: AstrMessageEvent, content: str,

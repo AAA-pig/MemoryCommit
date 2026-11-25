@@ -48,7 +48,7 @@ dirty、python 与 pytest 版本。脚本一改，旧报告就对不上，先看
 param(
     [string]$RepoRoot,
     [string]$BackupDir,
-    [string]$RollbackTarget,
+    [string]$RollbackTarget = "8677e13",
     [string]$Python,
     [string]$OutDir,
     [switch]$DryRun,
@@ -58,7 +58,6 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $RepoRoot) { $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
-if (-not $RollbackTarget) { throw "请用 -RollbackTarget 指定回滚点提交（历史重写后硬编码哈希会失效）" }
 if (-not $BackupDir) { $BackupDir = Join-Path $RepoRoot ("backups\2026-11-14-" + $RollbackTarget) }
 if (-not $OutDir) { $OutDir = Join-Path $RepoRoot "tools\drill_out" }
 
@@ -373,7 +372,7 @@ function Restore-TestsToTarget($work) {
 
     为什么不沿用旧写法：旧实现只按 `git ls-tree <回滚点> -- tests` 的名单
     删除「回滚点之后新增」的测试文件，同名文件保持新版内容不动。于是
-    tests/test_ledger.py、tests/test_memory_duty.py 这类在 schema6 定版 被改过的
+    tests/test_ledger.py、tests/test_memory_duty.py 这类在 1149e3b 被改过的
     文件，会带着新断言去跑旧代码，必然红 —— 那是脚本口径造成的假红，
     不是回滚点不健康。现在改成：
       1) 删掉副本里的 tests/ 整棵树（隔离副本，删了只影响副本）

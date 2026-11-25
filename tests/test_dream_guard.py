@@ -34,7 +34,12 @@ _SKIP_DIRS = {".venv", ".git", "__pycache__", ".pytest_cache", "node_modules"}
 
 
 def _project_py_files():
-    for p in sorted(PROJECT_ROOT.rglob("*.py")):
+    paths = []
+    for folder, dirs, files in os.walk(PROJECT_ROOT):
+        paths.extend(pathlib.Path(folder, name) for name in dirs + files
+                     if pathlib.Path(name).match("*.py"))
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+    for p in sorted(paths):
         if any(part in _SKIP_DIRS for part in p.parts):
             continue
         yield p
@@ -227,7 +232,7 @@ class DreamGuardTest(unittest.TestCase):
     def test_denial_survives_auto_classification(self):
         """实测复现过的 bug：deny 之后跑一次 classify_pair，disputed 被冲掉。
 
-        用户说一句「你记错了」权重最高、立刻生效——它不能被随后的
+        老大说一句「你记错了」权重最高、立刻生效——它不能被随后的
         自动分类覆盖，否则降权与停止主动提起只维持到下一次分类为止。
         """
         a = self.led.remember("今天很冷我要喝热的", tags=["天气"])["memory_id"]
@@ -244,7 +249,7 @@ class DreamGuardTest(unittest.TestCase):
 
     def test_denial_revoke_is_the_only_way_out(self):
         """解除否认只有一条路：用户显式撤销；自动写入永远解不开。"""
-        a = self.led.remember("用户说他不吃辣", tags=["饮食"])["memory_id"]
+        a = self.led.remember("老大说他不吃辣", tags=["饮食"])["memory_id"]
         self.led.deny_memory(a, "我没说过")
         self.led.dream_apply([], [{"memory_id": a, "status": "active", "reason": "梦觉得没问题"}])
         self.assertIn(a, self.led.denied_ids(), "梦境回写不能解开否认")

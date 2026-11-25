@@ -2,7 +2,7 @@
 
 ## 数据修复 — 2026-11-17
 
-- 一次性数据修复（不改 schema、不走提交链伪造历史）：真库 ledger.db 里 35 条 memory 行的 start_time / end_time 是 16 位无秒格式（"YYYY-MM-DD HH:MM"，上游同步脚本旧版写入，m763 就在其中），memory_age_days 解析不出，统一追加 ":00"（条件：长度=16 且第 11 位是空格，单事务裸 SQL，仅此一次）；修前已用 SQLite backup API 整库备份至 %USERPROFILE%\.local\share\jingjing-memory\backup\ledger-pre-tsfix-<ts>.db（约 9.2 MB）
+- 一次性数据修复（不改 schema、不走提交链伪造历史）：真库 ledger.db 里 35 条 memory 行的 start_time / end_time 是 16 位无秒格式（"YYYY-MM-DD HH:MM"，B 站同步脚本旧版写入，m763 就在其中），memory_age_days 解析不出，统一追加 ":00"（条件：长度=16 且第 11 位是空格，单事务裸 SQL，仅此一次）；修前已用 SQLite backup API 整库备份至 C:\Users\20708\.local\share\jingjing-memory\backup\ledger-pre-tsfix-20261117-134149.db（9,678,848 字节）
 
 ## 1.6.0 — 2026-11-14
 
@@ -77,7 +77,7 @@
 - **conftest.py 移出生产覆盖率门禁**：门禁只认 `ledger.py` / `main.py`（`--fail-under=100`），conftest 作为测试夹具单独报一次数字、不影响退出码；脚本注释与 README「覆盖率口径」都写明了为什么（它不是随插件发布的逻辑，算进总账只会让数字好看）。需要旧口径时加 `-IncludeConftest`
 - **CHANGELOG 脱敏**：删掉残留的本机绝对路径，改为「某个装了 coverage 的虚拟环境」
 - **schema 5→6 升级演练（副本上做，真库零写入）**：三件套（`.db` + `-wal` + `-shm`）一起拷；在 02:54 的 v5 备份（schema 5、17 表、无 creative）上跑 `Ledger()` 打开：schema 5→6，`creative` 与 `idx_creative_seq` 建出，memory 576 / clue 1134 / message 898 / access_log 1932 / memory_clue 3468 逐表不变，`integrity_check=ok`，二次打开完全幂等（不再迁移、不建提交）。`_migrate_auto_sink_legacy` **会**额外建 1 个提交（C95→C96）：36 条旧沉淀补 `type:auto_sink`、摘 252 条机器标签边（`memory_link` 15142→14890）。方案与回滚条件见 `docs/升级-schema5-to-6-方案.md`
-- **实测**：`tools/coverage_check.ps1` → `524 passed`，`ledger.py 2138/2138 + main.py 583/583`（分支 892+198）双 100%，退出码 0；conftest 单列 44/44、6/6。`tools/rollback_drill.ps1` 实跑：场景 A 红（failed=19，报警器有效）；场景 B 红（failed=3）——**这是脚本 B 场景的已知盲点，不是回滚点坏了**：B 只按 `git ls-tree` 名单删掉新增测试文件、不还原名单内文件的旧内容，`tests/test_ledger.py` / `test_memory_duty.py` 留着 HEAD 的新断言（`test_schema_is_v5` 等）去跑 v5 代码，必然红。上轮 B 绿是因为当时这两个文件还没被 `schema6 定版` 改过
+- **实测**：`tools/coverage_check.ps1` → `524 passed`，`ledger.py 2138/2138 + main.py 583/583`（分支 892+198）双 100%，退出码 0；conftest 单列 44/44、6/6。`tools/rollback_drill.ps1` 实跑：场景 A 红（failed=19，报警器有效）；场景 B 红（failed=3）——**这是脚本 B 场景的已知盲点，不是回滚点坏了**：B 只按 `git ls-tree` 名单删掉新增测试文件、不还原名单内文件的旧内容，`tests/test_ledger.py` / `test_memory_duty.py` 留着 HEAD 的新断言（`test_schema_is_v5` 等）去跑 v5 代码，必然红。上轮 B 绿是因为当时这两个文件还没被 `1149e3b` 改过
 
 ### v9 打回返工（2026-11-15）
 
@@ -87,7 +87,7 @@
 - **升级文档真有**：`docs/升级-schema5-to-6-方案.md`（约 280 行）。含三件套备份的确切命令、副本预演逐表行数对照表、卸载 → 重载 → 验证七步与逐条判定阈值表、回滚触发条件与已知代价、以及第 0 节的排障警示
 - **新增排障警示（第 0 节）**：只读探真库必须 `file:...?mode=ro`，**不能加 `immutable=1`**——加了会跳过 WAL，读到 checkpoint 之前的旧快照，表现是「迁移明明跑了，看着像没跑」。同一份三件套副本上实测对照：`mode=ro` → schema 6 / C101 / 18 表 / creative 存在 / message 932 / access_log 1983 / memory_link 14890；`mode=ro&immutable=1` → schema 5 / C99 / 17 表 / 无 creative / message 928 / access_log 1977 / memory_link 15166。上一轮「真库还是 schema 5」的误判就是这条参数造成的
 - **数据口径补上取数时刻**：`message 930` / `access_log 1980` 是 **04:14:53** 那份三件套副本的读数（`-wal` 383192 字节，探针 04:22:46 跑完），不是「现在的读数」。04:31:05 复测同一真库：`message 932` / `access_log 1983`，其余逐表一分不差——只增表在 WAL 里继续涨是正常现象，不是数据异常。文档第 1 节把两次读数并排列出
-- **`memory_link` 少 7 条：给出可复现命令与两组数字**（不再只说「一模一样」）。A 组真库副本：当前 14890 / 重放 14897 / 差 −7 / 缺失 7 条 / 多出 0 / 内容不同 0；B 组对照组（打开前把 `_migrate_auto_sink_legacy` 换成空实现，同一份 v5 备份）：当前 15142 / 重放 15149 / 差 −7 / 缺失同样的 7 条 / 多出 0 / 内容不同 0。7 条为 `m3|m1|记忆账本`、`m3|m2|记忆账本`、`m4|m3|方向`、`m4|m3|用户交代`、`m4|m3|脱离AstrBot`、`m5|m3|脱离AstrBot`、`m5|m4|脱离AstrBot`；查 `commit_row` 确认它们分别由 C8 / C10 / C14 `insert`、**链里没有任何 delete 记录**，属早期绕过提交链删库留下的历史欠账。脚本 `drill_link_diff.py` / `drill_link_trace.py` 已落在演练目录，可复跑
+- **`memory_link` 少 7 条：给出可复现命令与两组数字**（不再只说「一模一样」）。A 组真库副本：当前 14890 / 重放 14897 / 差 −7 / 缺失 7 条 / 多出 0 / 内容不同 0；B 组对照组（打开前把 `_migrate_auto_sink_legacy` 换成空实现，同一份 v5 备份）：当前 15142 / 重放 15149 / 差 −7 / 缺失同样的 7 条 / 多出 0 / 内容不同 0。7 条为 `m3|m1|记忆账本`、`m3|m2|记忆账本`、`m4|m3|方向`、`m4|m3|老大交代`、`m4|m3|脱离AstrBot`、`m5|m3|脱离AstrBot`、`m5|m4|脱离AstrBot`；查 `commit_row` 确认它们分别由 C8 / C10 / C14 `insert`、**链里没有任何 delete 记录**，属早期绕过提交链删库留下的历史欠账。脚本 `drill_link_diff.py` / `drill_link_trace.py` 已落在演练目录，可复跑
 - **脱敏**：`CHANGELOG.md` 里最后一处本机绝对路径删掉（改为「某个装了 coverage 的虚拟环境」）；`docs/升级-schema5-to-6-方案.md` 里的数据目录改成 `%USERPROFILE%\.local\share\jingjing-memory`，不再写死用户名
 - **实测**：`524 passed / 0 failed`；`tools/coverage_check.ps1` → `ledger.py 2138/2138 + main.py 583/583`（分支 892+198）双 100%，conftest 单列 44/44、6/6，退出码 0
 
@@ -118,7 +118,7 @@
 
 ## 1.5.2 — 2026-11-14
 
-第三轮锐评的修复：让「沉淀不进提示词」对存量数据也成立，并把沉淀在存储层降回索引。
+第三轮锐评（fb9dfa4）的修复：让「沉淀不进提示词」对存量数据也成立，并把沉淀在存储层降回索引。
 
 ### N6 存量沉淀识别与迁移
 
@@ -154,17 +154,17 @@
 - 路线名统一成代码真实 route 值（search / associate / activate / fallback / fallback_blocked / none）：activate 注释、CHANGELOG、README 三处；recall 的 match 值 direct / clue / graph 是「命中来源」不是路线名，已注明
 - README「没命中一字节都不注入」改成与 fallback 说明一致的口径；「沉淀条目不进提示词」补存量迁移说明
 - 更正 1.5.1 段两处陈述：路线名（原写 search / associate / graph / fresh / fallback）；「存量边不自动回收」（N6 迁移落地后已回收）
-- 1.5.1 段补记补全：1.5.0 后期…1.5.1 之前 两波改动的完整清单（见 1.5.1 的「补记」小节）
+- 1.5.1 段补记补全：34bf72d..954ef20 两波改动的完整清单（见 1.5.1 的「补记」小节）
 
 ### 测试
 
-- 459 passed（基线 444：新增 14、改造 3——cmd_compact 两条按确认词新行为改写、_as_int 断言修正）。新增：1.5.0 末期 写库→新代码打开的迁移测试（含幂等与注入断言）、auto_sink_ids 双标记口径与前缀撞车、10 条沉淀不挤掉 search、fallback 破例浮现跳过沉淀（另钉 eligible 双保险：候选池过滤失效时仍兕底）、沉淀不抢座/不进冲刷计划/不推冲刷量、正文去前缀、子串标签不连沉淀、/记忆压缩 确认词、_fmt_hit 争议标注、_as_int Overflow、落链失败不升级为唤起失败
+- 459 passed（基线 444：新增 14、改造 3——cmd_compact 两条按确认词新行为改写、_as_int 断言修正）。新增：954ef20 写库→新代码打开的迁移测试（含幂等与注入断言）、auto_sink_ids 双标记口径与前缀撞车、10 条沉淀不挤掉 search、fallback 破例浮现跳过沉淀（另钉 eligible 双保险：候选池过滤失效时仍兕底）、沉淀不抢座/不进冲刷计划/不推冲刷量、正文去前缀、子串标签不连沉淀、/记忆压缩 确认词、_fmt_hit 争议标注、_as_int Overflow、落链失败不升级为唤起失败
 - 环境开关反向验证：设 `DREAM_SCHEDULER_ENABLED=true` + `EMOTION_ENABLED=true` 全量重跑，459 passed（修复前 3+1 failed）
 - 全部用临时库；评审自带复现脚本（probe3_ledger / probe3_force / probe3_chain）在修复后重跑，A/B/B2/C/F 段全部转为预期行为
 
 ### 补钉（2026-11-14 追加）：N11 说明缺口 + R4/R5 两个全绿变异
 
-评审报告（b80136c 三轮锐评）2.2 节变异表三个全绿漏网里，`auto_sink_ids` 精确匹配已随 N6 的口径与撞车测试收掉，本轮再收掉剩下两个：
+评审报告（fb9dfa4 三轮锐评）2.2 节变异表三个全绿漏网里，`auto_sink_ids` 精确匹配已随 N6 的口径与撞车测试收掉，本轮再收掉剩下两个：
 
 - **N11：`type:` 保留前缀写进工具说明**。`memory_write` 的描述此前只说「标签相同的历史记忆会自动连边」，没告诉模型 `type:` 前缀被 `is_machine_tag` 整体保留——模型写 `type:preference` 这类标签后会发现两条记忆之间没有边却不知道原因。现在描述明确写清：`type:` 开头的标签是保留前缀，用于内部类型标记，不参与连边、也不会被当成语义概念，标记语义请用普通词；写入返回文本在 tags 带 `type:` 前缀时附带一句提醒（普通标签不多嘴；现有断言只认「已写入」开头，不受影响）。选「写说明 + 返回提醒」而不是「入口剥掉 type: 标签」：剥标签改的是模型输入的语义，代价高且超出本轮范围。补测三条：描述含「保留前缀」说明、返回提醒有/无的对照、两条 `type:preference` 记忆 0 边 + 同样两条普通标签有边的对照组。
 - **钉住 R4**：`test_replay_delete_identifies_row_by_row_key` 造两条同 from/to、只有 concept 不同的 `memory_link` 边，删除行按老版 forget 形态只存 strength（before 缺身份字段），row_key 是唯一身份来源；断言重放删的正是 row_key 指定的那一条、另一条还在、health 对账通过。变异「重放删除不解析 row_key（退回 before 拼身份）」当场变红（幽灵残留 + 对账不一致）；变异「按 from/to 粗匹配删除」同样变红（没删的那条被误删）。
@@ -182,9 +182,9 @@
 
 自动沉淀降级收尾（N1 + N2）。1.5.0 之后两波改动当时没进本文件、版本号也没动，这次补记（完整清单见下方「补记」小节，2026-11-14 追记补全），并把「类型标记参与建图」这个新洞修掉。
 
-### 补记：1.5.0 发布后、1.5.1 之前的两波改动（1.5.0 后期…1.5.1 之前）
+### 补记：1.5.0 发布后、1.5.1 之前的两波改动（34bf72d..954ef20）
 
-**第一波（1.5.0 后期三次提交，P0/P1 修复）：**
+**第一波（34bf72d / 468731f / e06a6ee，P0/P1 修复）：**
 
 - **自动沉淀最初引入**：外壳不依赖模型自觉，每 6 轮（`JJ_MEMORY_AUTO_SINK_EVERY`）把原文折成一条 day 记忆——当时默认开启，1.5.1 改默认关
 - **写路径失败计数**：`FailureCounter`，失败不再只留一行 warning，/记忆自检 能报「哪条写路径在悄悄失败」
@@ -193,7 +193,7 @@
 - **原文链检索上限**：`SEARCH_CANDIDATE_CAP=200` / `SEARCH_EXPANDED_CAP=2000`，无命中时扩窗重试并标 truncated，不再全表逐行切词
 - **遗忘报错说清原因**；命令面与边界分支补测（ledger/main 行覆盖率 100%）
 
-**第二波（1.5.0 末期，第二轮评审修复）：**
+**第二波（954ef20，第二轮评审修复）：**
 
 - **R1 鉴权**：11 个 /记忆* 命令与五个 LLM 工具全部只认 owner（UMO 名单），非 owner 统一拒答；备份只能落专用目录、默认不覆盖、路径成分剥掉；破坏性操作精确确认（「确认」必须是独立词）
 - **R5 备份 v2**：文件头带每表行数清单、尾部 `__eof__` 标记、导入严格校验、落库前临时库预演（`DUMP_VERSION 1 → 2`）

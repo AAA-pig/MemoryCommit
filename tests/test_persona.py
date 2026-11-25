@@ -137,7 +137,7 @@ class PersonaTest(unittest.TestCase):
 
     def test_core_readonly_three_guards(self):
         core_id = self.led._seed_persona_core(
-            [{"content": "身份：助手", "priority": 100}])[0]
+            [{"content": "身份：星辰", "priority": 100}])[0]
         # 1) update 拦截
         with self.assertRaises(L.LedgerError):
             self.led.update_persona(core_id, content="改了")
@@ -150,7 +150,7 @@ class PersonaTest(unittest.TestCase):
         # 行还在、内容没变
         rows = self.led.list_persona("core")
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["content"], "身份：助手")
+        self.assertEqual(rows[0]["content"], "身份：星辰")
 
     def test_builder_layer_core_guards_too(self):
         """builder 层同样拦：_allow_core 是唯一旁路，且不暴露给上层包装。"""
@@ -167,7 +167,7 @@ class PersonaTest(unittest.TestCase):
     def test_seed_via_allow_core_only(self):
         """显式播种走 _allow_core=True，seed 后哨兵自动封好。"""
         ids = self.led._seed_persona_core([
-            {"content": "身份：助手", "priority": 100},
+            {"content": "身份：星辰", "priority": 100},
             {"content": "语气：克制", "priority": 90, "source": "manual"},
         ])
         self.assertEqual(len(ids), 2)
@@ -179,7 +179,7 @@ class PersonaTest(unittest.TestCase):
     # ---------- 哈希哨兵 ----------
 
     def test_hash_sentinel_tamper_alarm_and_reseal(self):
-        core_id = self.led._seed_persona_core([{"content": "身份：助手"}])[0]
+        core_id = self.led._seed_persona_core([{"content": "身份：星辰"}])[0]
         self.assertTrue(self.led._verify_persona_core_seal("clean")["ok"])
         # 手工 SQL 绕过提交链改 core 行（模拟篡改）
         db = self.led.db_path
@@ -269,7 +269,7 @@ class PersonaTest(unittest.TestCase):
     # ---------- 回放一致 / integrity ----------
 
     def test_replay_and_health_after_persona_writes(self):
-        self.led._seed_persona_core([{"content": "身份：助手", "priority": 100}])
+        self.led._seed_persona_core([{"content": "身份：星辰", "priority": 100}])
         pid = self.led.add_persona("self", "喜欢简洁", priority=10)
         self.led.update_persona(pid, priority=30)
         self.led.add_persona("self", "临时条目")
@@ -282,7 +282,7 @@ class PersonaTest(unittest.TestCase):
     # ---------- 备份：v5 往返 / v4 兼容 ----------
 
     def test_dump_v6_roundtrip(self):
-        self.led._seed_persona_core([{"content": "身份：助手", "priority": 100}])
+        self.led._seed_persona_core([{"content": "身份：星辰", "priority": 100}])
         self.led.add_persona("self", "喜欢简洁", priority=10, source="test")
         dump_path = os.path.join(self.tmp, "dump.jsonl")
         text = self.led.dump_jsonl(dump_path)
@@ -296,7 +296,7 @@ class PersonaTest(unittest.TestCase):
             self.assertEqual(led2.schema_version(), 8)
             core = led2.list_persona("core")
             self.assertEqual(len(core), 1)
-            self.assertEqual(core[0]["content"], "身份：助手")
+            self.assertEqual(core[0]["content"], "身份：星辰")
             self.assertEqual(core[0]["source"], "seed")
             self.assertEqual(len(led2.list_persona("self")), 1)
             self.assertTrue(led2._verify_persona_core_seal("rt")["ok"])
@@ -555,9 +555,9 @@ class AutoSinkGuardTest(unittest.TestCase):
         """
         with self.led.restricted_auto_write():
             with self.assertRaises(L.LedgerError):
-                self.led._seed_persona_core([{"content": "身份：助手"}])
+                self.led._seed_persona_core([{"content": "身份：星辰"}])
         self.assertEqual(self.led._auto_write_guard, 0)
-        ids = self.led._seed_persona_core([{"content": "身份：助手"}])
+        ids = self.led._seed_persona_core([{"content": "身份：星辰"}])
         self.assertEqual(len(ids), 1)
         self.assertTrue(self.led._verify_persona_core_seal("in-guard")["ok"])
 
@@ -729,7 +729,7 @@ def test_memory_persona_tool_full_cycle(tmp_path, monkeypatch):
 
 def test_memory_persona_tool_list_hides_core_rows(tmp_path, monkeypatch):
     plugin = _fresh_plugin(tmp_path, monkeypatch)
-    plugin.ledger._seed_persona_core([{"content": "身份：助手基础设定"}])
+    plugin.ledger._seed_persona_core([{"content": "身份：星辰基础设定"}])
     plugin.ledger.add_persona("self", "自我设定一条")
     out = _tool(plugin, action="list")
     assert "自我设定一条" in out
@@ -738,13 +738,13 @@ def test_memory_persona_tool_list_hides_core_rows(tmp_path, monkeypatch):
 
 def test_memory_persona_tool_core_row_untouchable(tmp_path, monkeypatch):
     plugin = _fresh_plugin(tmp_path, monkeypatch)
-    core_id = plugin.ledger._seed_persona_core([{"content": "身份：助手"}])[0]
+    core_id = plugin.ledger._seed_persona_core([{"content": "身份：星辰"}])[0]
     out = _tool(plugin, action="update", id=core_id, content="改基础设定")
     assert out.startswith("没完成") and "只读" in out
     out = _tool(plugin, action="remove", id=core_id)
     assert out.startswith("没完成") and "只读" in out
     rows = plugin.ledger.list_persona("core")
-    assert rows[0]["content"] == "身份：助手", "core 行一个字没动"
+    assert rows[0]["content"] == "身份：星辰", "core 行一个字没动"
 
 
 def test_memory_persona_tool_validations(tmp_path, monkeypatch):
@@ -774,10 +774,10 @@ def test_cmd_persona_list_empty(tmp_path, monkeypatch):
 
 def test_cmd_persona_list_marks_core_readonly(tmp_path, monkeypatch):
     plugin = _fresh_plugin(tmp_path, monkeypatch)
-    plugin.ledger._seed_persona_core([{"content": "身份：助手", "priority": 100}])
+    plugin.ledger._seed_persona_core([{"content": "身份：星辰", "priority": 100}])
     plugin.ledger.add_persona("self", "自我设定", priority=5)
     out = _persona_cmd(plugin, "/人格")
-    assert "基础·只读" in out and "身份：助手" in out
+    assert "基础·只读" in out and "身份：星辰" in out
     assert "[自我 · 权重 5]" in out and "自我设定" in out
 
 
@@ -813,7 +813,7 @@ def test_cmd_persona_update_flow(tmp_path, monkeypatch):
 
 def test_cmd_persona_update_core_refused(tmp_path, monkeypatch):
     plugin = _fresh_plugin(tmp_path, monkeypatch)
-    core_id = plugin.ledger._seed_persona_core([{"content": "身份：助手"}])[0]
+    core_id = plugin.ledger._seed_persona_core([{"content": "身份：星辰"}])[0]
     out = _persona_cmd(plugin, "/人格 改 %s 改基础" % core_id)
     assert "没改成" in out and "只读" in out
 
@@ -830,7 +830,7 @@ def test_cmd_persona_remove_flow(tmp_path, monkeypatch):
 
 def test_cmd_persona_remove_core_refused(tmp_path, monkeypatch):
     plugin = _fresh_plugin(tmp_path, monkeypatch)
-    core_id = plugin.ledger._seed_persona_core([{"content": "身份：助手"}])[0]
+    core_id = plugin.ledger._seed_persona_core([{"content": "身份：星辰"}])[0]
     out = _persona_cmd(plugin, "/人格 删 %s" % core_id)
     assert "没删掉" in out and "只读" in out
 
@@ -846,9 +846,13 @@ def test_cmd_persona_unknown_sub(tmp_path, monkeypatch):
 PERSONA_WRITE_NAMES = {"add_persona", "update_persona", "remove_persona"}
 
 
-def _main_ast():
-    with open(os.path.join(PLUGIN_DIR, "main.py"), encoding="utf-8") as f:
+def _file_ast(name):
+    with open(os.path.join(PLUGIN_DIR, name), encoding="utf-8") as f:
         return ast.parse(f.read())
+
+
+def _main_ast():
+    return _file_ast("main.py")
 
 
 def _find_func(tree, name):
@@ -868,8 +872,9 @@ def test_auto_sink_source_has_no_persona_writes():
     用 restricted_auto_write 收口（接线不许拆）。
     """
     tree = _main_ast()
-    for name in ("_auto_sink", "auto_sink_summary"):
-        fn = _find_func(tree, name)
+    # 折索引的纯函数已拆到 sink.py，两处都要扫：只要有一处碰人格写口就红。
+    for name, where in (("_auto_sink", tree), ("auto_sink_summary", _file_ast("sink.py"))):
+        fn = _find_func(where, name)
         for sub in ast.walk(fn):
             if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
                 assert sub.func.attr not in PERSONA_WRITE_NAMES, (
@@ -899,7 +904,7 @@ def test_auto_sink_leaves_core_rule_untouched(tmp_path, monkeypatch):
     """
     plugin = _fresh_plugin(tmp_path, monkeypatch)
     plugin.ledger._seed_persona_core([
-        {"content": "身份：助手", "priority": 100}])
+        {"content": "身份：星辰", "priority": 100}])
     plugin.ledger.add_persona("self", "喜欢简洁", priority=10)
     before = [dict(r) for r in plugin.ledger.list_persona()]
     import main as m
