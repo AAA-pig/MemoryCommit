@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 1.6.1 — 2026-11-26
+
+内部拆分解耦。对外命令与数据库契约不变：`SCHEMA_VERSION=8` / `DUMP_VERSION=6` / `CORE_API_VERSION=4` 全部保持。
+
+- **P1-1 核心文件拆分完成**：原 `ledger.py` 单文件多职责（检索 / 生命周期 / 备份 / 自检），拆成 15 个生产模块——`ledger`（入口与组装）+ `ledger_core` / `ledger_schema` / `ledger_commit` / `ledger_recall` / `ledger_history` / `ledger_persona` / `ledger_dream` / `ledger_maintenance` / `ledger_archive` / `ledger_status`，配套 `main` / `memory_commands` / `persona_cmd` / `sink`。最大文件 579 行（`main.py`），全部 ≤800 行。
+- **过程**：拆分先在桌面副本 `_sandbox_clean` 做等价验证，按 C1–C10 逐条提交，验证等价后合并进本体（`360120c refactor: 合并 sandbox 拆分版进本体`）。
+- **兼容性（破坏性，第三方直连需读）**：旧的内部模块路径已合并消失（如 `ledger_storage` → `ledger_schema`、`plugin_utils` / `views` / `sink_runtime` → `sink` 等，完整对照见 `docs/refactor-closeout.md`）。插件自身入口与 AstrBot 注册不变，账本库文件不变。
+- **验收**：本体工作树干净，`python -m pytest -q` → **736 passed, 1 skipped**（22.24 秒）。本次未重跑 `tools/coverage_check.ps1` 的 100% 覆盖率门禁，故不列为本版通过条件。
+- **版本号**：`metadata.yaml` / `pyproject.toml` / `main.PLUGIN_VERSION` 三处同步为 1.6.1（由 `test_versions_single_source` 钉住），`uv.lock` 项目版本同步。
+
 ## 数据修复 — 2026-11-17
 
 - 一次性数据修复（不改 schema、不走提交链伪造历史）：真库 ledger.db 里 35 条 memory 行的 start_time / end_time 是 16 位无秒格式（"YYYY-MM-DD HH:MM"，B 站同步脚本旧版写入，m763 就在其中），memory_age_days 解析不出，统一追加 ":00"（条件：长度=16 且第 11 位是空格，单事务裸 SQL，仅此一次）；修前已用 SQLite backup API 整库备份至 C:\Users\20708\.local\share\jingjing-memory\backup\ledger-pre-tsfix-20261117-134149.db（9,678,848 字节）
@@ -110,7 +120,7 @@
 
 ### 未做（写清楚，别当成已实现）
 
-- **P1-1 核心文件拆分**：ledger.py 仍是单文件多职责（检索/生命周期/备份/自检都在里面）。原因：拆分前要先补公开接口契约测试与 golden dataset 对账，牵动全部测试基线，值得单独一轮做，塞进加固轮只会拆一半留烂尾
+- **P1-1 核心文件拆分**：*已于 1.6.1 完成，见该版条目。* 本轮未做的原始理由：拆分前要先补公开接口契约测试与 golden dataset 对账，牵动全部测试基线，值得单独一轮做，塞进加固轮只会拆一半留烂尾
 - **P1-2 检索评测集**：没有建立评测查询集与指标脚本（Recall@5 / MRR 等）。原因：需要标注数据与固定数据集版本，属于建立质量基准的新工作，不是本轮「修对错」的范围内
 - **P1-6 provenance 来源体系**：记忆没有统一来源字段与权限矩阵（user_explicit / auto_summary 等）。原因：动表结构要 schema 版本迁移，还要理清与现有 tags / type: 机器标记的关系，需要单独设计
 - **P0-2 外部锚定**：只把安全表述说准，没有实现链头导出 / HMAC / 签名。原因：涉及密钥管理与外部存储选型，是独立的工程决策

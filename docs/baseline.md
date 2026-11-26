@@ -1,7 +1,7 @@
 # 重构基线（阶段 0）
 
 锚点：`main` = **8d4fce6**，tag `baseline`。基线之后所有行为对比都以它为准
-（origin 落后不管，本阶段只在本地跑）。`PLUGIN_VERSION` = 1.6.0，`SCHEMA_VERSION` = 8。
+（origin 落后不管，本阶段只在本地跑）。`PLUGIN_VERSION` = 1.6.1，`SCHEMA_VERSION` = 8。
 
 复验只要两条命令，都在副本目录下：
 

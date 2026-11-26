@@ -262,7 +262,7 @@ LLM 工具（仅限授权会话；主人通常只把私聊配进 `JJ_MEMORY_OWNE
 
 | 版本号 | 单一来源 | 管什么 |
 |---|---|---|
-| 插件版本 `1.6.0` | `pyproject.toml` 与 `metadata.yaml` | 发布版本，两处必须一致 |
+| 插件版本 `1.6.1` | `pyproject.toml` 与 `metadata.yaml` | 发布版本，两处必须一致 |
 | `SCHEMA_VERSION = 8` | `ledger.py` | 库的表结构 |
 | `DUMP_VERSION = 6` | `ledger.py` | 备份文件的排版 |
 | `CORE_API_VERSION = 4` | `ledger.py` | 宿主能调的公开接口 |
